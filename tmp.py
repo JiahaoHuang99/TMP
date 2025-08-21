@@ -257,4 +257,144 @@ def radius_map_voronoi_indices(mask, centerline_prob, spacing, thresh=0.5):
         return D.copy(), D
 
     # 3) 中心线半径
-    r_center = np.zeros_like(D, dt
+    r_center = np.zeros_like(D, dtype=np.float32)
+    r_center[C] = D[C]
+
+    # 4) 最近中心线分配（Voronoi on skeleton）
+    #    对“非中心线”为 True 的布尔图做 EDT 并取 return_indices
+    non_center = (~C)
+    _, indices = distance_transform_edt(non_center, sampling=spacing, return_indices=True)
+
+    R = np.zeros_like(D, dtype=np.float32)
+    if mask.ndim == 3:
+        iz, iy, ix = indices  # 最近中心线坐标
+        R[mask] = r_center[iz[mask], iy[mask], ix[mask]]
+    else:
+        iy, ix = indices
+        R[mask] = r_center[iy[mask], ix[mask]]
+
+    # 5) 上界裁剪
+    np.minimum(R, D, out=R)
+    return R, D
+
+
+def radius_change_on_centerline(D, centerline_prob, spacing, thresh=0.5, connectivity=26, agg='max'):
+    """
+    计算中心线上每个体素的 |dr/ds|，其它体素为 0。
+    D               : np.ndarray float32, EDT(mask, sampling=spacing)，单位=mm
+    centerline_prob : np.ndarray float32, 软中心线概率（或硬中心线0/1）
+    spacing         : 3D:(sz,sy,sx) 或 2D:(sy,sx)（与 D 对应）
+    """
+    import numpy as np
+
+    C = (centerline_prob >= thresh)
+    V = np.zeros_like(D, dtype=np.float32)
+
+    if D.ndim == 3:
+        Z, Y, X = D.shape
+        offs, wts = _make_offsets_weights_3d(connectivity, spacing)
+        coords = np.array(np.where(C)).T  # [M,3] (z,y,x)
+        for (z, y, x) in coords:
+            r0 = D[z, y, x]
+            if agg == 'max':
+                best = 0.0
+            else:
+                ssum = 0.0
+                cnt  = 0
+            for (dz, dy, dx), w in zip(offs, wts):
+                zn, yn, xn = z + int(dz), y + int(dy), x + int(dx)
+                if (0 <= zn < Z) and (0 <= yn < Y) and (0 <= xn < X) and C[zn, yn, xn]:
+                    slope = abs(r0 - D[zn, yn, xn]) / float(w)  # 1/mm
+                    if agg == 'max':
+                        if slope > best:
+                            best = slope
+                    else:
+                        ssum += slope
+                        cnt  += 1
+            V[z, y, x] = best if agg == 'max' else (ssum / cnt if cnt > 0 else 0.0)
+
+    elif D.ndim == 2:
+        H, W = D.shape
+        conn2d = connectivity if connectivity in (4, 8) else 8
+        offs, wts = _make_offsets_weights_2d(conn2d, spacing)
+        coords = np.array(np.where(C)).T  # [M,2] (y,x)
+        for (y, x) in coords:
+            r0 = D[y, x]
+            if agg == 'max':
+                best = 0.0
+            else:
+                ssum = 0.0
+                cnt  = 0
+            for (dy, dx), w in zip(offs, wts):
+                yn, xn = y + int(dy), x + int(dx)
+                if (0 <= yn < H) and (0 <= xn < W) and C[yn, xn]:
+                    slope = abs(r0 - D[yn, xn]) / float(w)  # 1/mm
+                    if agg == 'max':
+                        if slope > best:
+                            best = slope
+                    else:
+                        ssum += slope
+                        cnt  += 1
+            V[y, x] = best if agg == 'max' else (ssum / cnt if cnt > 0 else 0.0)
+
+    else:
+        raise ValueError("Only 2D/3D supported.")
+
+    return V
+
+
+# =========================
+# Main
+# =========================
+if __name__ == "__main__":
+
+    # ====== Set device ======
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # ====== Step 1: Load input segmentation ======
+    input_nii = "/mnt/workspace/aneurysm/nnUNetCAS/nnunetv2/tools/2016_CT1376811_cta.nii.gz"
+    tensor, affine, header = load_nii_to_tensor(input_nii)
+    spacing = header.get_zooms()  # 3D: (sz, sy, sx)
+
+    tensor_1cls = (tensor > 0).type_as(tensor)
+    tensor = tensor.to(device)        # GPU（仅骨架这步用）
+    tensor_1cls = tensor_1cls.to(device)
+
+    # ====== Step 2: Extract skeleton (保持不变，用软骨架) ======
+    model = SoftSkeletonize(num_iter=40).to(device)
+    skeleton = model(tensor_1cls)     # (1,1,D,H,W), 0~1 概率
+
+    # ====== Step 3: Save skeleton as NIfTI ======
+    out_skel = "/mnt/workspace/aneurysm/nnUNetCAS/nnunetv2/tools/2016_CT1376811_cta_skeleton_soft.nii.gz"
+    save_tensor_to_nii(skeleton.cpu(), affine, header, out_skel)
+    print(f"Done: Skeleton saved -> {out_skel}")
+
+    # ====== Step 4: Radius map（启用 return_indices 版本；保留 Dijkstra 可切换） ======
+    # 转 numpy（在 CPU 做，省显存）
+    mask_np = (tensor_1cls[0,0].detach().cpu().numpy() > 0)
+    soft_np = skeleton[0,0].detach().cpu().numpy().astype(np.float32)
+
+    USE_VORONOI_INDICES = True  # ← True: 快速省显存方案；False: 用你原来的 Dijkstra
+    if USE_VORONOI_INDICES:
+        R_np, D_np = radius_map_voronoi_indices(mask_np, soft_np, spacing=spacing, thresh=0.5)
+    else:
+        R_np, D_np = radius_map_dijkstra(mask_np, soft_np, spacing=spacing, thresh=0.5, connectivity=26)
+
+    # ====== Step 4.5: 计算中心线的 |dr/ds|（单位 1/mm）======
+    V_np = radius_change_on_centerline(D_np, soft_np, spacing=spacing, thresh=0.5, connectivity=26, agg='max')
+
+    # ====== Step 5: Save ======
+    R_t = torch.from_numpy(R_np)[None, None]  # (1,1,D,H,W)
+    out_radius = "/mnt/workspace/aneurysm/nnUNetCAS/nnunetv2/tools/2016_CT1376811_cta_radius_mm_indices.nii.gz" \
+                 if USE_VORONOI_INDICES else \
+                 "/mnt/workspace/aneurysm/nnUNetCAS/nnunetv2/tools/2016_CT1376811_cta_radius_mm_dijkstra.nii.gz"
+    save_tensor_to_nii(R_t, affine, header, out_radius)
+    print(f"Done: Radius saved -> {out_radius}")
+
+    V_t = torch.from_numpy(V_np)[None, None]
+    out_var = "/mnt/workspace/aneurysm/nnUNetCAS/nnunetv2/tools/2016_CT1376811_cta_radius_change_abs_on_centerline_per_mm_indices.nii.gz" \
+              if USE_VORONOI_INDICES else \
+              "/mnt/workspace/aneurysm/nnUNetCAS/nnunetv2/tools/2016_CT1376811_cta_radius_change_abs_on_centerline_per_mm_dijkstra.nii.gz"
+    save_tensor_to_nii(V_t, affine, header, out_var)
+    print(f"Done: |dr/ds| saved -> {out_var}")
