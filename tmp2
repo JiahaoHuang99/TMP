@@ -1,0 +1,78 @@
+def get_rmap(self, seg_logit: torch.Tensor, spacing=(1.0, 1.0, 1.0), skel_thresh: float = 0.5) -> torch.Tensor:
+    """
+    从 seg_logit 生成半径图 rmap（单位=spacing 的物理单位，通常 mm）
+    seg_logit: (B,C,D,H,W)
+    spacing  : (sz,sy,sx) 或 [ (sz,sy,sx) for b in range(B) ]
+    return   : rmap (B,1,D,H,W)  float32
+    """
+    import numpy as np
+    from scipy.ndimage import distance_transform_edt
+
+    assert seg_logit.ndim == 5, "seg_logit must be (B,C,D,H,W)"
+    B, C, Dd, H, W = seg_logit.shape
+    dev = seg_logit.device
+    dtype_out = torch.float32
+
+    # --- 1) seg_logit -> label -> binary mask (>=1 合并成 1) ---
+    with torch.no_grad():
+        if C == 1:
+            # 二类但只有一个通道的情况：按 sigmoid+0.5 阈值
+            mask = (torch.sigmoid(seg_logit[:, 0]) > 0.5)  # (B,D,H,W) bool
+        else:
+            label = torch.argmax(seg_logit, dim=1)         # (B,D,H,W)
+            mask = (label >= 1)                             # (B,D,H,W) bool
+
+        # --- 2) Soft skeleton（保持你现有实现，不改动）---
+        # 作为中心线“概率”输入后续阈值化
+        mask_f = mask.float().unsqueeze(1)                  # (B,1,D,H,W)
+        skel_module = SoftSkeletonize(num_iter=40).to(dev)
+        soft_center = skel_module(mask_f)                   # (B,1,D,H,W), 0~1
+
+    # --- 3) 定义：基于 EDT 的“最近中心线分配”（Voronoi on skeleton） ---
+    def _radius_map_voronoi_indices(mask_np: np.ndarray, center_prob_np: np.ndarray, sp):
+        """
+        mask_np: bool (D,H,W)
+        center_prob_np: float32 (D,H,W)
+        sp: (sz,sy,sx)
+        return: R(np.float32, D,H,W)
+        """
+        # 内部 EDT（mm）
+        Dmm = distance_transform_edt(mask_np, sampling=sp).astype(np.float32)
+
+        # 中心线阈值
+        Csk = (center_prob_np >= skel_thresh) & mask_np
+        if not np.any(Csk):
+            return Dmm  # 没有中心线：半径=本地内切球
+
+        # 中心线半径
+        r_center = np.zeros_like(Dmm, dtype=np.float32)
+        r_center[Csk] = Dmm[Csk]
+
+        # 最近中心线分配
+        non_center = (~Csk)
+        _, indices = distance_transform_edt(non_center, sampling=sp, return_indices=True)
+        iz, iy, ix = indices
+        R = np.zeros_like(Dmm, dtype=np.float32)
+        R[mask_np] = r_center[iz[mask_np], iy[mask_np], ix[mask_np]]
+        # 上界裁剪（物理合理性）
+        np.minimum(R, Dmm, out=R)
+        return R
+
+    # --- 4) 逐样本在 CPU 上生成 rmap，最后拼回到 seg_logit.device ---
+    r_list = []
+    with torch.no_grad():
+        # 统一 spacing 格式
+        if isinstance(spacing, (list, tuple)) and len(spacing) == B and isinstance(spacing[0], (list, tuple)):
+            spacings = spacing
+        else:
+            spacings = [spacing] * B
+
+        for b in range(B):
+            mask_np = mask[b].detach().cpu().numpy().astype(bool)                 # (D,H,W)
+            soft_np = soft_center[b, 0].detach().cpu().numpy().astype(np.float32) # (D,H,W)
+            spb = tuple(float(x) for x in spacings[b])
+            R_np = _radius_map_voronoi_indices(mask_np, soft_np, spb)             # (D,H,W)
+            r_list.append(torch.from_numpy(R_np)[None])                           # (1,D,H,W)
+
+        rmap = torch.stack(r_list, dim=0).to(dev, dtype=dtype_out, non_blocking=True)  # (B,1,D,H,W)
+    return rmap
