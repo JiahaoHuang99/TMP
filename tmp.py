@@ -88,7 +88,7 @@ def save_tensor_to_nii(tensor, affine, header, out_path):
 
 
 # =========================
-# 多源 Dijkstra / FMM 半径回填（省显存）
+# 多源 Dijkstra / FMM 半径回填（原有，保留可切换）
 # =========================
 def _make_offsets_weights_3d(connectivity, spacing):
     sz, sy, sx = spacing
@@ -232,124 +232,29 @@ def radius_map_dijkstra(mask, centerline_prob, spacing, thresh=0.5, connectivity
     else:
         raise ValueError("Only 2D/3D supported.")
 
-def radius_change_on_centerline(D, centerline_prob, spacing, thresh=0.5, connectivity=26, agg='max'):
-    """
-    计算中心线上每个体素的 |dr/ds|，其它体素为 0。
-    D               : np.ndarray float32, EDT(mask, sampling=spacing)，单位=mm
-    centerline_prob : np.ndarray float32, 软中心线概率（或硬中心线0/1）
-    spacing         : 3D:(sz,sy,sx) 或 2D:(sy,sx)（与 D 对应）
-    thresh          : 中心线阈值（与半径回填时一致）
-    connectivity    : 3D: 6/18/26；2D: 4/8
-    agg             : 'max'（默认）或 'mean'，邻域差分的聚合方式
-    return          : V，形状同 D，中心线处为 |dr/ds|，其余为 0；单位=1/mm
-    """
-    import numpy as np
-
-    C = (centerline_prob >= thresh)
-    V = np.zeros_like(D, dtype=np.float32)
-
-    if D.ndim == 3:
-        Z, Y, X = D.shape
-        offs, wts = _make_offsets_weights_3d(connectivity, spacing)
-        coords = np.array(np.where(C)).T  # [M,3] (z,y,x)
-        for (z, y, x) in coords:
-            r0 = D[z, y, x]
-            if agg == 'max':
-                best = 0.0
-            else:
-                ssum = 0.0
-                cnt  = 0
-            for (dz, dy, dx), w in zip(offs, wts):
-                zn, yn, xn = z + int(dz), y + int(dy), x + int(dx)
-                if (0 <= zn < Z) and (0 <= yn < Y) and (0 <= xn < X) and C[zn, yn, xn]:
-                    slope = abs(r0 - D[zn, yn, xn]) / float(w)  # 1/mm
-                    if agg == 'max':
-                        if slope > best:
-                            best = slope
-                    else:
-                        ssum += slope
-                        cnt  += 1
-            V[z, y, x] = best if agg == 'max' else (ssum / cnt if cnt > 0 else 0.0)
-
-    elif D.ndim == 2:
-        H, W = D.shape
-        # 2D 时 connectivity 只能取 4/8；若传了 6/18/26，退化为 8
-        conn2d = connectivity if connectivity in (4, 8) else 8
-        offs, wts = _make_offsets_weights_2d(conn2d, spacing)
-        coords = np.array(np.where(C)).T  # [M,2] (y,x)
-        for (y, x) in coords:
-            r0 = D[y, x]
-            if agg == 'max':
-                best = 0.0
-            else:
-                ssum = 0.0
-                cnt  = 0
-            for (dy, dx), w in zip(offs, wts):
-                yn, xn = y + int(dy), x + int(dx)
-                if (0 <= yn < H) and (0 <= xn < W) and C[yn, xn]:
-                    slope = abs(r0 - D[yn, xn]) / float(w)  # 1/mm
-                    if agg == 'max':
-                        if slope > best:
-                            best = slope
-                    else:
-                        ssum += slope
-                        cnt  += 1
-            V[y, x] = best if agg == 'max' else (ssum / cnt if cnt > 0 else 0.0)
-
-    else:
-        raise ValueError("Only 2D/3D supported.")
-
-    return V
-
 
 # =========================
-# Main
+# 新增：EDT return_indices 实现的“最近中心线分配”（更快/更省显存）
 # =========================
-if __name__ == "__main__":
+def radius_map_voronoi_indices(mask, centerline_prob, spacing, thresh=0.5):
+    """
+    用 SciPy EDT 的 return_indices 做最近中心线分配：
+      1) D = EDT(mask)  -> 内部到边界的物理距离（mm）
+      2) C = centerline_prob>=thresh
+      3) r_center = D on C
+      4) 每个体素取最近的中心线坐标索引（indices），回填半径
+      5) R = min(R, D)
+    """
+    mask = np.asarray(mask) > 0
+    prob = np.asarray(centerline_prob).astype(np.float32)
 
-    # ====== Set device ======
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # device = torch.device("cpu")
-    print(f"Using device: {device}")
+    # 1) 内部 EDT（mm）
+    D = distance_transform_edt(mask, sampling=spacing).astype(np.float32)
 
-    # ====== Step 1: Load input segmentation ======
-    input_nii = "/mnt/workspace/aneurysm/nnUNetCAS/nnunetv2/tools/2016_CT1376811_cta.nii.gz"
-    tensor, affine, header = load_nii_to_tensor(input_nii)
-    spacing = header.get_zooms()  # 3D: (sz, sy, sx)
+    # 2) 中心线（可来自 soft skeleton 的阈值）
+    C = (prob >= thresh) & mask
+    if not np.any(C):
+        return D.copy(), D
 
-    tensor_1cls = (tensor > 0).type_as(tensor)
-    tensor = tensor.to(device)  # Move to GPU
-    tensor_1cls = tensor_1cls.to(device)  # Move to GPU
-
-    # ====== Step 2: Extract skeleton ======
-    model = SoftSkeletonize(num_iter=40).to(device)  # Move model to GPU
-    skeleton = model(tensor_1cls)
-
-    # ====== Step 3: Save skeleton as NIfTI ======
-    out_skel = "/mnt/workspace/aneurysm/nnUNetCAS/nnunetv2/tools/2016_CT1376811_cta_skeleton_soft.nii.gz"
-    save_tensor_to_nii(skeleton.cpu(), affine, header, out_skel)
-    print(f"Done: Skeleton saved -> {out_skel}")
-
-
-    # ====== Step 4: Radius map via multi-source Dijkstra (省显存) ======
-    # 转 numpy
-    mask_np = (tensor_1cls[0,0].detach().cpu().numpy() > 0)
-    soft_np = skeleton[0,0].detach().cpu().numpy().astype(np.float32)
-    # 计算半径（mm）与内距（mm）
-    R_np, D_np = radius_map_dijkstra(mask_np, soft_np, spacing=spacing, thresh=0.5, connectivity=26)
-
-    # ====== Step 4.5: 计算中心线的 |dr/ds|（单位 1/mm）======
-    V_np = radius_change_on_centerline(D_np, soft_np, spacing=spacing, thresh=0.5, connectivity=26, agg='max')
-
-
-    # ====== Step 5: Save radius map ======
-    R_t = torch.from_numpy(R_np)[None, None]  # (1,1,D,H,W)
-    out_radius = "/mnt/workspace/aneurysm/nnUNetCAS/nnunetv2/tools/2016_CT1376811_cta_radius_mm_sci.nii.gz"
-    save_tensor_to_nii(R_t, affine, header, out_radius)
-    print(f"Done: Radius saved -> {out_radius}")
-
-    # 保存（只在中心线处为正，其它位置=0；便于可视化/统计）
-    V_t = torch.from_numpy(V_np)[None, None]  # (1,1,D,H,W)
-    out_var = "/mnt/workspace/aneurysm/nnUNetCAS/nnunetv2/tools/2016_CT1376811_cta_radius_change_abs_on_centerline_per_mm_sci.nii.gz"
-    save_tensor_to_nii(V_t, affine, header, out_var)
-    print(f"Done: |dr/ds| saved -> {out_var}")
+    # 3) 中心线半径
+    r_center = np.zeros_like(D, dt
