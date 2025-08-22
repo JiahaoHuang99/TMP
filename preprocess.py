@@ -131,8 +131,8 @@ def export_multislab(pre_dir, out_dir, target=(128,256,256), margin_mm=(30,30,30
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pre_dir", required=True, help="path to nnUNet_preproc/.../stage0")
-    ap.add_argument("--out_dir", required=True, help="where to save npz")
+    ap.add_argument("--pre_dir", default="/mnt/workspace/workgroup/lanxin.hjh/project/aneurysm/nnUNetCas_output/nnUNet_preprocessed/Dataset086_artery_nct_aneu_base/nnUNetPlans_3d_fullres")
+    ap.add_argument("--out_dir", default="/mnt/workspace/workgroup/lanxin.hjh/project/aneurysm/my_preprocessed/npz")
     ap.add_argument("--target", type=str, default="128,256,256")
     ap.add_argument("--margin_mm", type=str, default="30,30,30")
     ap.add_argument("--mode", choices=["single","multislab"], default="single")
