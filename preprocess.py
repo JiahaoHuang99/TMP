@@ -1,112 +1,148 @@
-import os
-import numpy as np
-import nibabel as nib
-import SimpleITK as sitk
+import os, argparse, pickle, numpy as np, json
 
-def mkdir(path):
-    if not os.path.exists(path):
-        os.makedirs(path)
+def load_pkl(p):
+    with open(p, 'rb') as f: return pickle.load(f)
 
-def resample_to_spacing(img, spacing=(1.5, 1.0, 1.0), is_label=False):
-    """重采样到统一 spacing"""
-    sitk_img = sitk.GetImageFromArray(img.get_fdata().astype(np.float32))
-    sitk_img.SetSpacing(img.header.get_zooms())
+def np_load_any(p):
+    # 尝试直接 np.load；如果你的环境有 nnUNet 的官方 IO，可替换为其读写函数
+    try:
+        return np.load(p, allow_pickle=False)
+    except Exception:
+        return np.load(p, allow_pickle=False, mmap_mode='r')
 
-    orig_spacing = sitk_img.GetSpacing()
-    orig_size = sitk_img.GetSize()
-    new_size = [
-        int(round(orig_size[i] * (orig_spacing[i] / spacing[i])))
-        for i in range(3)
-    ]
+def fg_bbox(seg):  # seg: (1,Z,Y,X) or (Z,Y,X)
+    s = seg[0] if seg.ndim == 4 else seg
+    idx = np.argwhere(s > 0)
+    if idx.size == 0:
+        return np.array([0,0,0]), np.array(s.shape)
+    mn = idx.min(0); mx = idx.max(0) + 1
+    return mn, mx
 
-    resample = sitk.ResampleImageFilter()
-    resample.SetOutputSpacing(spacing)
-    resample.SetSize(new_size)
-    resample.SetInterpolator(sitk.sitkNearestNeighbor if is_label else sitk.sitkLinear)
+def expand_mm(mn, mx, spacing_zyx, shape_zyx, margin_mm=(30,30,30)):
+    vox = np.round(np.array(margin_mm)/np.array(spacing_zyx)).astype(int)
+    mn2 = np.maximum(mn - vox, 0)
+    mx2 = np.minimum(mx + vox, np.array(shape_zyx))
+    return mn2, mx2
 
-    sitk_resampled = resample.Execute(sitk_img)
-    resampled_np = sitk.GetArrayFromImage(sitk_resampled)
-    return resampled_np, sitk_resampled.GetSpacing()
+def crop(arr, mn, mx):  # arr: (C,Z,Y,X) or (Z,Y,X)
+    if arr.ndim == 4:
+        return arr[:, mn[0]:mx[0], mn[1]:mx[1], mn[2]:mx[2]]
+    else:
+        return arr[mn[0]:mx[0], mn[1]:mx[1], mn[2]:mx[2]]
 
-def crop_to_nonzero(image_np, label_np, margin=10):
-    """根据 label 裁剪 + margin"""
-    coords = np.argwhere(label_np > 0)
-    min_z, min_y, min_x = coords.min(axis=0)
-    max_z, max_y, max_x = coords.max(axis=0)
+def center_crop_pad(arr, target_zyx, pad_val=0):
+    tz, ty, tx = target_zyx
+    if arr.ndim == 4:
+        C, Z, Y, X = arr.shape; out = np.full((C,tz,ty,tx), pad_val, arr.dtype)
+        zs=max((tz-Z)//2,0); ys=max((ty-Y)//2,0); xs=max((tx-X)//2,0)
+        ze=min(zs+Z,tz); ye=min(ys+Y,ty); xe=min(xs+X,tx)
+        z0=max((Z-tz)//2,0); y0=max((Y-ty)//2,0); x0=max((X-tx)//2,0)
+        out[:, zs:ze, ys:ye, xs:xe] = arr[:, z0:z0+(ze-zs), y0:y0+(ye-ys), x0:x0+(xe-xs)]
+    else:
+        Z, Y, X = arr.shape; out = np.full((tz,ty,tx), pad_val, arr.dtype)
+        zs=max((tz-Z)//2,0); ys=max((ty-Y)//2,0); xs=max((tx-X)//2,0)
+        ze=min(zs+Z,tz); ye=min(ys+Y,ty); xe=min(xs+X,tx)
+        z0=max((Z-tz)//2,0); y0=max((Y-ty)//2,0); x0=max((X-tx)//2,0)
+        out[zs:ze, ys:ye, xs:xe] = arr[z0:z0+(ze-zs), y0:y0+(ye-ys), x0:x0+(xe-xs)]
+    return out
 
-    min_z = max(min_z - margin, 0)
-    min_y = max(min_y - margin, 0)
-    min_x = max(min_x - margin, 0)
-    max_z = min(max_z + margin, image_np.shape[0] - 1)
-    max_y = min(max_y + margin, image_np.shape[1] - 1)
-    max_x = min(max_x + margin, image_np.shape[2] - 1)
+def save_npz(path, image, label, spacing_zyx, meta):
+    np.savez_compressed(path,
+        image=image.astype(np.float32),
+        label=label.astype(np.uint8),
+        spacing=np.asarray(spacing_zyx, np.float32),
+        **meta
+    )
 
-    image_cropped = image_np[min_z:max_z+1, min_y:max_y+1, min_x:max_x+1]
-    label_cropped = label_np[min_z:max_z+1, min_y:max_y+1, min_x:max_x+1]
-    return image_cropped, label_cropped
+def export_single(pre_dir, out_dir, target=(128,256,256), margin_mm=(30,30,30)):
+    os.makedirs(out_dir, exist_ok=True)
+    cases = [f[:-4] for f in os.listdir(pre_dir) if f.endswith(".pkl")]
+    for stem in cases:
+        img = np_load_any(os.path.join(pre_dir, f"{stem}.b2nd"))      # (C,Z,Y,X)
+        seg = np_load_any(os.path.join(pre_dir, f"{stem}_seg.b2nd"))  # (1,Z,Y,X) or (Z,Y,X)
+        props = load_pkl(os.path.join(pre_dir, f"{stem}.pkl"))
+        spacing = props.get('spacing')  # 期望为 [Z,Y,X]；根据你的 props 校验
 
-def pad_or_crop_to_shape(image_np, label_np, target_shape=(128, 256, 256)):
-    """CenterCrop / Pad 到固定大小"""
-    def process(arr, target_shape):
-        out = np.zeros(target_shape, dtype=arr.dtype)
-        in_shape = arr.shape
-        offset = [(target_shape[i] - in_shape[i]) // 2 for i in range(3)]
+        mn, mx = fg_bbox(seg)
+        shape = img.shape[1:] if img.ndim==4 else img.shape
+        mn, mx = expand_mm(mn, mx, spacing, shape, margin_mm=margin_mm)
 
-        z_min = max(-offset[0], 0); z_max = min(in_shape[0], target_shape[0]-offset[0])
-        y_min = max(-offset[1], 0); y_max = min(in_shape[1], target_shape[1]-offset[1])
-        x_min = max(-offset[2], 0); x_max = min(in_shape[2], target_shape[2]-offset[2])
+        img_roi = crop(img, mn, mx)
+        seg_roi = crop(seg, mn, mx)
 
-        out_z_min = max(offset[0], 0); out_z_max = out_z_min + (z_max - z_min)
-        out_y_min = max(offset[1], 0); out_y_max = out_y_min + (y_max - y_min)
-        out_x_min = max(offset[2], 0); out_x_max = out_x_min + (x_max - x_min)
+        img_fix = center_crop_pad(img_roi, target)
+        seg_fix = center_crop_pad(seg_roi, target)
 
-        out[out_z_min:out_z_max, out_y_min:out_y_max, out_x_min:out_x_max] = arr[z_min:z_max, y_min:y_max, x_min:x_max]
-        return out
+        meta = dict(case_id=stem, roi_bbox=np.asarray([*mn, *mx], np.int32))
+        outp = os.path.join(out_dir, f"{stem}_128x256x256.npz")
+        save_npz(outp, img_fix, seg_fix, spacing, meta)
+        print("saved:", outp)
 
-    image_fixed = process(image_np, target_shape)
-    label_fixed = process(label_np, target_shape)
-    return image_fixed, label_fixed
+def export_multislab(pre_dir, out_dir, target=(128,256,256), margin_mm=(30,30,30), overlap_z=32):
+    os.makedirs(out_dir, exist_ok=True)
+    index = []
+    cases = [f[:-4] for f in os.listdir(pre_dir) if f.endswith(".pkl")]
+    for stem in cases:
+        img = np_load_any(os.path.join(pre_dir, f"{stem}.b2nd"))
+        seg = np_load_any(os.path.join(pre_dir, f"{stem}_seg.b2nd"))
+        props = load_pkl(os.path.join(pre_dir, f"{stem}.pkl"))
+        spacing = props.get('spacing')
 
-def process_case(image_path, label_path, out_npz_dir, out_nii_dir, target_shape=(128,256,256)):
-    case_id = os.path.basename(image_path).replace(".nii.gz", "")
-    print(f"Processing {case_id}...")
+        mn, mx = fg_bbox(seg)
+        shape = img.shape[1:] if img.ndim==4 else img.shape
+        mn, mx = expand_mm(mn, mx, spacing, shape, margin_mm=margin_mm)
 
-    img = nib.load(image_path)
-    lbl = nib.load(label_path)
+        img_roi = crop(img, mn, mx)
+        seg_roi = crop(seg, mn, mx)
+        _, Z, Y, X = img_roi.shape if img_roi.ndim==4 else (1,)+img_roi.shape
 
-    # Step1: 重采样
-    image_resampled, spacing = resample_to_spacing(img, is_label=False)
-    label_resampled, _ = resample_to_spacing(lbl, is_label=True)
+        tz, ty, tx = target
+        z0 = 0
+        slab_id = 0
+        while z0 < Z:
+            z1 = min(z0 + tz, Z)
+            # 保证最后一块也至少 tz，如果不足则回拉
+            if z1 - z0 < tz and Z >= tz:
+                z0 = max(Z - tz, 0)
+                z1 = Z
+            slicer = slice(z0, z1)
 
-    # Step2: ROI + margin
-    image_cropped, label_cropped = crop_to_nonzero(image_resampled, label_resampled)
+            if img_roi.ndim == 4:
+                img_sub = img_roi[:, slicer, :, :]
+                seg_sub = seg_roi[:, slicer, :, :]
+            else:
+                img_sub = img_roi[slicer, :, :]
+                seg_sub = seg_roi[slicer, :, :]
 
-    # Step3: CenterCrop / Pad
-    image_fixed, label_fixed = pad_or_crop_to_shape(image_cropped, label_cropped, target_shape)
+            img_fix = center_crop_pad(img_sub, (tz, ty, tx))
+            seg_fix = center_crop_pad(seg_sub, (tz, ty, tx))
 
-    # Step4: 保存 npz
-    npz_out = os.path.join(out_npz_dir, case_id + ".npz")
-    np.savez_compressed(npz_out, image=image_fixed[None], label=label_fixed[None])  # 加 channel 维度
+            meta = dict(case_id=stem, slab=slab_id, z_range_in_roi=[int(z0), int(z1)], roi_bbox=np.asarray([*mn, *mx], np.int32))
+            outp = os.path.join(out_dir, f"{stem}_slab{slab_id:03d}_128x256x256.npz")
+            save_npz(outp, img_fix, seg_fix, spacing, meta)
+            index.append(dict(file=os.path.basename(outp), case=stem, slab=slab_id, z0=int(z0), z1=int(z1)))
+            print("saved:", outp)
 
-    # Step5: 保存处理后的 nii.gz 便于检查
-    img_out = nib.Nifti1Image(image_fixed.astype(np.float32), np.eye(4))
-    lbl_out = nib.Nifti1Image(label_fixed.astype(np.uint8), np.eye(4))
-    nib.save(img_out, os.path.join(out_nii_dir, case_id + "_image.nii.gz"))
-    nib.save(lbl_out, os.path.join(out_nii_dir, case_id + "_label.nii.gz"))
-
-    print(f"Saved {case_id}: npz + nii.gz")
+            if z1 >= Z: break
+            z0 = z1 - overlap_z
+            slab_id += 1
+    with open(os.path.join(out_dir, "multislab_index.json"), "w") as f:
+        json.dump(index, f, indent=2)
 
 if __name__ == "__main__":
-    input_images = "dataset_raw/imagesTr"
-    input_labels = "dataset_raw/labelsTr"
-    out_npz_dir = "dataset_processed/npz"
-    out_nii_dir = "dataset_processed/preprocessed_nii"
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pre_dir", required=True, help="path to nnUNet_preproc/.../stage0")
+    ap.add_argument("--out_dir", required=True, help="where to save npz")
+    ap.add_argument("--target", type=str, default="128,256,256")
+    ap.add_argument("--margin_mm", type=str, default="30,30,30")
+    ap.add_argument("--mode", choices=["single","multislab"], default="single")
+    ap.add_argument("--overlap_z", type=int, default=32)
+    args = ap.parse_args()
 
-    mkdir(out_npz_dir)
-    mkdir(out_nii_dir)
+    tz, ty, tx = map(int, args.target.split(","))
+    mm = tuple(map(float, args.margin_mm.split(",")))
 
-    for fname in os.listdir(input_images):
-        if fname.endswith(".nii.gz"):
-            image_path = os.path.join(input_images, fname)
-            label_path = os.path.join(input_labels, fname)  # 假设 image/label 文件名对应
-            process_case(image_path, label_path, out_npz_dir, out_nii_dir)
+    if args.mode == "single":
+        export_single(args.pre_dir, args.out_dir, target=(tz,ty,tx), margin_mm=mm)
+    else:
+        export_multislab(args.pre_dir, args.out_dir, target=(tz,ty,tx), margin_mm=mm, overlap_z=args.overlap_z)
