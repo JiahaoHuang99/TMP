@@ -1,78 +1,532 @@
-def get_rmap(self, seg_logit: torch.Tensor, spacing=(1.0, 1.0, 1.0), skel_thresh: float = 0.5) -> torch.Tensor:
-    """
-    从 seg_logit 生成半径图 rmap（单位=spacing 的物理单位，通常 mm）
-    seg_logit: (B,C,D,H,W)
-    spacing  : (sz,sy,sx) 或 [ (sz,sy,sx) for b in range(B) ]
-    return   : rmap (B,1,D,H,W)  float32
-    """
-    import numpy as np
-    from scipy.ndimage import distance_transform_edt
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+批处理：为一个文件夹内的 label NIfTI 计算软中心线与半径图，并输出：
+  1) *_R_full.nii.gz              （半径回填到整个 mask）
+  2) *_R_centerline.nii.gz        （仅中心线体素处有半径，其余为0）
+  3) *_label_plus_R.nii.gz        （4D：channel0=label, channel1=R_full）
+"""
+import os
+import sys
+import glob
+import math
+import heapq
+import argparse
+import numpy as np
+import nibabel as nib
+import torch
+import torch.nn.functional as F
+from heapq import heappush, heappop
+from scipy.ndimage import distance_transform_edt
 
-    assert seg_logit.ndim == 5, "seg_logit must be (B,C,D,H,W)"
-    B, C, Dd, H, W = seg_logit.shape
-    dev = seg_logit.device
-    dtype_out = torch.float32
 
-    # --- 1) seg_logit -> label -> binary mask (>=1 合并成 1) ---
-    with torch.no_grad():
-        if C == 1:
-            # 二类但只有一个通道的情况：按 sigmoid+0.5 阈值
-            mask = (torch.sigmoid(seg_logit[:, 0]) > 0.5)  # (B,D,H,W) bool
+# =========================
+# SoftSkeletonize
+# =========================
+class SoftSkeletonize(torch.nn.Module):
+    def __init__(self, num_iter=40):
+        super(SoftSkeletonize, self).__init__()
+        self.num_iter = num_iter
+
+    def soft_erode(self, img):
+        if len(img.shape) == 4:
+            p1 = -F.max_pool2d(-img, (3, 1), (1, 1), (1, 0))
+            p2 = -F.max_pool2d(-img, (1, 3), (1, 1), (0, 1))
+            return torch.min(p1, p2)
+        elif len(img.shape) == 5:
+            p1 = -F.max_pool3d(-img, (3, 1, 1), (1, 1, 1), (1, 0, 0))
+            p2 = -F.max_pool3d(-img, (1, 3, 1), (1, 1, 1), (0, 1, 0))
+            p3 = -F.max_pool3d(-img, (1, 1, 3), (1, 1, 1), (0, 0, 1))
+            return torch.min(torch.min(p1, p2), p3)
         else:
-            label = torch.argmax(seg_logit, dim=1)         # (B,D,H,W)
-            mask = (label >= 1)                             # (B,D,H,W) bool
+            raise ValueError("Only 2D/3D supported for soft_erode.")
 
-        # --- 2) Soft skeleton（保持你现有实现，不改动）---
-        # 作为中心线“概率”输入后续阈值化
-        mask_f = mask.float().unsqueeze(1)                  # (B,1,D,H,W)
-        skel_module = SoftSkeletonize(num_iter=40).to(dev)
-        soft_center = skel_module(mask_f)                   # (B,1,D,H,W), 0~1
+    def soft_dilate(self, img):
+        if len(img.shape) == 4:
+            return F.max_pool2d(img, (3, 3), (1, 1), (1, 1))
+        elif len(img.shape) == 5:
+            return F.max_pool3d(img, (3, 3, 3), (1, 1, 1), (1, 1, 1))
+        else:
+            raise ValueError("Only 2D/3D supported for soft_dilate.")
 
-    # --- 3) 定义：基于 EDT 的“最近中心线分配”（Voronoi on skeleton） ---
-    def _radius_map_voronoi_indices(mask_np: np.ndarray, center_prob_np: np.ndarray, sp):
-        """
-        mask_np: bool (D,H,W)
-        center_prob_np: float32 (D,H,W)
-        sp: (sz,sy,sx)
-        return: R(np.float32, D,H,W)
-        """
-        # 内部 EDT（mm）
-        Dmm = distance_transform_edt(mask_np, sampling=sp).astype(np.float32)
+    def soft_open(self, img):
+        return self.soft_dilate(self.soft_erode(img))
 
-        # 中心线阈值
-        Csk = (center_prob_np >= skel_thresh) & mask_np
-        if not np.any(Csk):
-            return Dmm  # 没有中心线：半径=本地内切球
+    def soft_skel(self, img):
+        img1 = self.soft_open(img)
+        skel = F.relu(img - img1)
+        for _ in range(self.num_iter):
+            img = self.soft_erode(img)
+            img1 = self.soft_open(img)
+            delta = F.relu(img - img1)
+            skel = skel + F.relu(delta - skel * delta)
+        return skel
 
-        # 中心线半径
-        r_center = np.zeros_like(Dmm, dtype=np.float32)
-        r_center[Csk] = Dmm[Csk]
+    def forward(self, img):
+        return self.soft_skel(img)
 
-        # 最近中心线分配
-        non_center = (~Csk)
-        _, indices = distance_transform_edt(non_center, sampling=sp, return_indices=True)
+
+# =========================
+# I/O Tools
+# =========================
+def load_nii(path):
+    img = nib.load(path)
+    data = img.get_fdata()  # float64
+    return data, img.affine, img.header
+
+def save_nii(array, affine, header, out_path):
+    array = np.asarray(array)
+    # 为避免某些软件报错，复制 header 再写
+    hdr = header.copy()
+    nib.save(nib.Nifti1Image(array, affine, hdr), out_path)
+
+def is_label_map_like(arr, max_unique_check=512):
+    """启发式判断：整数型 或 唯一值数较少（<max_unique_check 且均接近整数）"""
+    a = np.asarray(arr)
+    if np.issubdtype(a.dtype, np.integer):
+        return True
+    # 如果是浮点，但唯一值不多且接近整数
+    if a.size <= 1:
+        return True
+    # 只抽样一部分以防巨大体积
+    sample = a.ravel()
+    if sample.size > 1_000_000:
+        sample = sample[:: max(1, sample.size // 1_000_000)]
+    uniq = np.unique(sample)
+    if len(uniq) <= max_unique_check:
+        # 检查是否接近整数
+        near_int = np.allclose(uniq, np.round(uniq), atol=1e-6)
+        return near_int
+    return False
+
+def to_binary_mask_from_label(arr):
+    """把 label map 压成二类：>=1 为 1，其他为 0。"""
+    return (np.asarray(arr) >= 1).astype(np.uint8)
+
+
+# =========================
+# Dijkstra/FMM 半径回填
+# =========================
+def _make_offsets_weights_3d(connectivity, spacing):
+    sz, sy, sx = spacing
+    offs, wts = [], []
+    for dz in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dz == 0 and dy == 0 and dx == 0:
+                    continue
+                manhattan = abs(dz) + abs(dy) + abs(dx)
+                if connectivity == 6 and manhattan != 1:
+                    continue
+                if connectivity == 18 and manhattan > 2:
+                    continue
+                offs.append((dz, dy, dx))
+                wts.append(np.sqrt((dz*sz)**2 + (dy*sy)**2 + (dx*sx)**2))
+    return np.asarray(offs, dtype=np.int8), np.asarray(wts, dtype=np.float32)
+
+def _make_offsets_weights_2d(connectivity, spacing):
+    sy, sx = spacing
+    offs, wts = [], []
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == 0 and dx == 0:
+                continue
+            manhattan = abs(dy) + abs(dx)
+            if connectivity == 4 and manhattan != 1:
+                continue
+            offs.append((dy, dx))
+            wts.append(np.sqrt((dy*sy)**2 + (dx*sx)**2))
+    return np.asarray(offs, dtype=np.int8), np.asarray(wts, dtype=np.float32)
+
+def radius_map_dijkstra(mask, centerline_prob, spacing, thresh=0.5, connectivity=26):
+    mask = np.asarray(mask) > 0
+    prob = np.asarray(centerline_prob).astype(np.float32)
+
+    if mask.ndim == 3:
+        Z, Y, X = mask.shape
+        assert len(spacing) == 3
+        D = distance_transform_edt(mask, sampling=spacing).astype(np.float32)
+
+        C = (prob >= thresh) & mask
+        if not np.any(C):
+            return D.copy(), D
+
+        dist = np.full(mask.shape, np.inf, dtype=np.float32)
+        label = np.full(mask.shape, -1, dtype=np.int32)
+        seeds = np.array(np.where(C)).T
+        r_seed = D[C].astype(np.float32)
+
+        heap = []
+        for i, (z, y, x) in enumerate(seeds):
+            dist[z, y, x] = 0.0
+            label[z, y, x] = i
+            heappush(heap, (0.0, int(z), int(y), int(x)))
+
+        offs, wts = _make_offsets_weights_3d(connectivity, spacing)
+
+        while heap:
+            d, z, y, x = heappop(heap)
+            if d != dist[z, y, x]:
+                continue
+            my_label = label[z, y, x]
+            for (dz, dy, dx), w in zip(offs, wts):
+                zn, yn, xn = z+int(dz), y+int(dy), x+int(dx)
+                if (zn < 0) or (zn >= Z) or (yn < 0) or (yn >= Y) or (xn < 0) or (xn >= X):
+                    continue
+                if not mask[zn, yn, xn]:
+                    continue
+                nd = d + float(w)
+                if nd < dist[zn, yn, xn]:
+                    dist[zn, yn, xn]  = nd
+                    label[zn, yn, xn] = my_label
+                    heappush(heap, (nd, zn, yn, xn))
+
+        R = np.zeros_like(D, dtype=np.float32)
+        in_mask = mask & (label >= 0)
+        if np.any(in_mask):
+            R[in_mask] = r_seed[label[in_mask]]
+        miss = mask & (label < 0)
+        if np.any(miss):
+            R[miss] = D[miss]
+        np.minimum(R, D, out=R)
+        return R, D
+
+    elif mask.ndim == 2:
+        H, W = mask.shape
+        assert len(spacing) == 2
+        D = distance_transform_edt(mask, sampling=spacing).astype(np.float32)
+
+        C = (prob >= thresh) & mask
+        if not np.any(C):
+            return D.copy(), D
+
+        dist  = np.full(mask.shape, np.inf, dtype=np.float32)
+        label = np.full(mask.shape, -1, dtype=np.int32)
+        seeds = np.array(np.where(C)).T
+        r_seed = D[C].astype(np.float32)
+
+        heap = []
+        for i, (y, x) in enumerate(seeds):
+            dist[y, x]  = 0.0
+            label[y, x] = i
+            heappush(heap, (0.0, int(y), int(x)))
+
+        offs, wts = _make_offsets_weights_2d(8 if connectivity not in (4,8) else connectivity, spacing)
+
+        while heap:
+            d, y, x = heappop(heap)
+            if d != dist[y, x]:
+                continue
+            my_label = label[y, x]
+            for (dy, dx), w in zip(offs, wts):
+                yn, xn = y+int(dy), x+int(dx)
+                if (yn < 0) or (yn >= H) or (xn < 0) or (xn >= W):
+                    continue
+                if not mask[yn, xn]:
+                    continue
+                nd = d + float(w)
+                if nd < dist[yn, xn]:
+                    dist[yn, xn]  = nd
+                    label[yn, xn] = my_label
+                    heappush(heap, (nd, yn, xn))
+
+        R = np.zeros_like(D, dtype=np.float32)
+        in_mask = mask & (label >= 0)
+        if np.any(in_mask):
+            R[in_mask] = r_seed[label[in_mask]]
+        miss = mask & (label < 0)
+        if np.any(miss):
+            R[miss] = D[miss]
+        np.minimum(R, D, out=R)
+        return R, D
+
+    else:
+        raise ValueError("Only 2D/3D supported.")
+
+
+# =========================
+# 新增：EDT return_indices 最近中心线分配
+# =========================
+def radius_map_voronoi_indices(mask, centerline_prob, spacing, thresh=0.5):
+    mask = np.asarray(mask) > 0
+    prob = np.asarray(centerline_prob).astype(np.float32)
+
+    D = distance_transform_edt(mask, sampling=spacing).astype(np.float32)
+
+    C = (prob >= thresh) & mask
+    if not np.any(C):
+        return D.copy(), D
+
+    r_center = np.zeros_like(D, dtype=np.float32)
+    r_center[C] = D[C]
+
+    non_center = (~C)
+    _, indices = distance_transform_edt(non_center, sampling=spacing, return_indices=True)
+
+    R = np.zeros_like(D, dtype=np.float32)
+    if mask.ndim == 3:
         iz, iy, ix = indices
-        R = np.zeros_like(Dmm, dtype=np.float32)
-        R[mask_np] = r_center[iz[mask_np], iy[mask_np], ix[mask_np]]
-        # 上界裁剪（物理合理性）
-        np.minimum(R, Dmm, out=R)
-        return R
+        R[mask] = r_center[iz[mask], iy[mask], ix[mask]]
+    else:
+        iy, ix = indices
+        R[mask] = r_center[iy[mask], ix[mask]]
 
-    # --- 4) 逐样本在 CPU 上生成 rmap，最后拼回到 seg_logit.device ---
-    r_list = []
+    np.minimum(R, D, out=R)
+    return R, D
+
+
+# =========================
+# 中心线处 |dr/ds|（可选调试）
+# =========================
+def radius_change_on_centerline(D, centerline_prob, spacing, thresh=0.5, connectivity=26, agg='max'):
+    C = (centerline_prob >= thresh)
+    V = np.zeros_like(D, dtype=np.float32)
+
+    if D.ndim == 3:
+        Z, Y, X = D.shape
+        offs, wts = _make_offsets_weights_3d(connectivity, spacing)
+        coords = np.array(np.where(C)).T  # [M,3]
+        for (z, y, x) in coords:
+            r0 = D[z, y, x]
+            if agg == 'max':
+                best = 0.0
+            else:
+                ssum = 0.0
+                cnt  = 0
+            for (dz, dy, dx), w in zip(offs, wts):
+                zn, yn, xn = z + int(dz), y + int(dy), x + int(dx)
+                if (0 <= zn < Z) and (0 <= yn < Y) and (0 <= xn < X) and C[zn, yn, xn]:
+                    slope = abs(r0 - D[zn, yn, xn]) / float(w)
+                    if agg == 'max':
+                        if slope > best:
+                            best = slope
+                    else:
+                        ssum += slope
+                        cnt  += 1
+            V[z, y, x] = best if agg == 'max' else (ssum / cnt if cnt > 0 else 0.0)
+
+    elif D.ndim == 2:
+        H, W = D.shape
+        offs, wts = _make_offsets_weights_2d(8, spacing)
+        coords = np.array(np.where(C)).T  # [M,2]
+        for (y, x) in coords:
+            r0 = D[y, x]
+            if agg == 'max':
+                best = 0.0
+            else:
+                ssum = 0.0
+                cnt  = 0
+            for (dy, dx), w in zip(offs, wts):
+                yn, xn = y + int(dy), x + int(dx)
+                if (0 <= yn < H) and (0 <= xn < W) and C[yn, xn]:
+                    slope = abs(r0 - D[yn, xn]) / float(w)
+                    if agg == 'max':
+                        if slope > best:
+                            best = slope
+                    else:
+                        ssum += slope
+                        cnt  += 1
+            V[y, x] = best if agg == 'max' else (ssum / cnt if cnt > 0 else 0.0)
+    else:
+        raise ValueError("Only 2D/3D supported.")
+    return V
+
+
+# =========================
+# 核心处理：单文件
+# =========================
+def process_one_file(
+    in_path, out_debug_dir, out_merged_dir,
+    use_voronoi=True, thresh=0.5, skel_iters=40, device=None,
+    save_centerline_r=True, save_skeleton_prob=False, use_dijkstra_connectivity=26
+):
+    basename = os.path.basename(in_path)
+    stem = basename.replace('.nii.gz', '').replace('.nii', '')
+
+    vol, affine, header = load_nii(in_path)
+    # 兼容 4D/时间维：若已有4D(…,C/T)，默认取第一个通道作为label
+    if vol.ndim == 4:
+        vol_label = vol[..., 0]
+    elif vol.ndim == 3:
+        vol_label = vol
+    elif vol.ndim == 2:
+        vol_label = vol
+    else:
+        raise ValueError(f"Unsupported ndim={vol.ndim} for {in_path}")
+
+    # 判断 label map：若不是，则仍然把>0作为前景
+    if is_label_map_like(vol_label):
+        bin_mask = to_binary_mask_from_label(vol_label)
+    else:
+        bin_mask = (vol_label > 0).astype(np.uint8)
+
+    # 构造 Torch 张量（B,C, …）
+    if bin_mask.ndim == 3:
+        ten = torch.from_numpy(bin_mask[None, None].astype(np.float32))
+    elif bin_mask.ndim == 2:
+        ten = torch.from_numpy(bin_mask[None, None].astype(np.float32))
+    else:
+        raise ValueError("Only 2D/3D supported after binarization.")
+
+    # 设备
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    ten = ten.to(device)
+
+    # 软中心线概率
+    model = SoftSkeletonize(num_iter=skel_iters).to(device).eval()
     with torch.no_grad():
-        # 统一 spacing 格式
-        if isinstance(spacing, (list, tuple)) and len(spacing) == B and isinstance(spacing[0], (list, tuple)):
-            spacings = spacing
-        else:
-            spacings = [spacing] * B
+        skel_prob = model(ten)  # (1,1, …), 0~1
 
-        for b in range(B):
-            mask_np = mask[b].detach().cpu().numpy().astype(bool)                 # (D,H,W)
-            soft_np = soft_center[b, 0].detach().cpu().numpy().astype(np.float32) # (D,H,W)
-            spb = tuple(float(x) for x in spacings[b])
-            R_np = _radius_map_voronoi_indices(mask_np, soft_np, spb)             # (D,H,W)
-            r_list.append(torch.from_numpy(R_np)[None])                           # (1,D,H,W)
+    # spacing
+    zms = header.get_zooms()
+    # NIfTI 2D 有时返回 (Y,X,1) 或 (Y,X)；3D 为 (Z,Y,X)
+    if len(zms) >= 3:
+        spacing = (float(zms[-3]), float(zms[-2]), float(zms[-1])) if bin_mask.ndim == 3 else (float(zms[-2]), float(zms[-1]))
+    elif len(zms) == 2:
+        spacing = (float(zms[0]), float(zms[1]))
+    else:
+        spacing = (1.0, 1.0, 1.0) if bin_mask.ndim == 3 else (1.0, 1.0)
 
-        rmap = torch.stack(r_list, dim=0).to(dev, dtype=dtype_out, non_blocking=True)  # (B,1,D,H,W)
-    return rmap
+    # 转 numpy 在 CPU 计算 R（省显存）
+    mask_np = (ten[0,0].detach().cpu().numpy() > 0)
+    soft_np = skel_prob[0,0].detach().cpu().numpy().astype(np.float32)
+
+    if use_voronoi:
+        R_np, D_np = radius_map_voronoi_indices(mask_np, soft_np, spacing=spacing, thresh=thresh)
+    else:
+        R_np, D_np = radius_map_dijkstra(mask_np, soft_np, spacing=spacing, thresh=thresh, connectivity=use_dijkstra_connectivity)
+
+    # 仅中心线处的 R（其他位置为0）
+    C = (soft_np >= thresh) & mask_np
+    R_centerline = np.zeros_like(R_np, dtype=np.float32)
+    R_centerline[C] = D_np[C]  # 中心线处半径=到边界的内距
+
+    # 保存调试：R_full、R_centerline、可选 skeleton 概率
+    os.makedirs(out_debug_dir, exist_ok=True)
+    r_full_path = os.path.join(out_debug_dir, f"{stem}_R_full.nii.gz")
+    save_nii(R_np.astype(np.float32), affine, header, r_full_path)
+
+    r_cl_path = None
+    if save_centerline_r:
+        r_cl_path = os.path.join(out_debug_dir, f"{stem}_R_centerline.nii.gz")
+        save_nii(R_centerline.astype(np.float32), affine, header, r_cl_path)
+
+    skel_path = None
+    if save_skeleton_prob:
+        skel_path = os.path.join(out_debug_dir, f"{stem}_skeleton_softprob.nii.gz")
+        save_nii(soft_np.astype(np.float32), affine, header, skel_path)
+
+    # 合并输出：4D 通道 [label, R_full]
+    os.makedirs(out_merged_dir, exist_ok=True)
+    # label 先保持原 dtype（常为整型），R 用 float32；为了一致性，最终 4D 使用 float32
+    lbl = (vol_label).astype(np.float32)
+    if lbl.ndim == 2:
+        merged = np.stack([lbl, R_np.astype(np.float32)], axis=-1)         # (H,W,2)
+    else:
+        merged = np.stack([lbl, R_np.astype(np.float32)], axis=-1)         # (Z,Y,X,2)
+
+    merged_path = os.path.join(out_merged_dir, f"{stem}_label_plus_R.nii.gz")
+    save_nii(merged, affine, header, merged_path)
+
+    return {
+        "in": in_path,
+        "r_full": r_full_path,
+        "r_centerline": r_cl_path,
+        "skeleton_prob": skel_path,
+        "merged": merged_path,
+        "spacing": spacing,
+        "vox_count": int(np.prod(mask_np.shape)),
+        "fg_count": int(mask_np.sum())
+    }
+
+
+# =========================
+# 批处理入口
+# =========================
+def main():
+    parser = argparse.ArgumentParser(description="批处理：提取软中心线并生成半径图（Rmap），并输出调试与合并 NIfTI。")
+    parser.add_argument("--input_dir", required=True, help="输入文件夹，包含 .nii 或 .nii.gz（应为label map或可二值化）")
+    parser.add_argument("--out_debug_dir", required=True, help="调试输出目录（R_full / R_centerline / 可选 skeleton）")
+    parser.add_argument("--out_merged_dir", required=True, help="合并输出目录（4D：label+R_full）")
+    parser.add_argument("--use_voronoi", action="store_true", help="使用 return_indices 的 Voronoi 版本（推荐）")
+    parser.add_argument("--use_dijkstra", action="store_true", help="使用 Dijkstra 版本（若同时给定，则以 Voronoi 优先）")
+    parser.add_argument("--thresh", type=float, default=0.5, help="软中心线概率阈值（默认0.5）")
+    parser.add_argument("--skel_iters", type=int, default=40, help="软骨架迭代次数（默认40）")
+    parser.add_argument("--save_skeleton_prob", action="store_true", help="是否保存 skeleton 概率 NIfTI（调试用）")
+    parser.add_argument("--connectivity", type=int, default=26, help="Dijkstra 版本的连通性（3D:6/18/26; 2D:4/8）")
+    args = parser.parse_args()
+
+    if args.use_voronoi:
+        use_voronoi = True
+    elif args.use_dijkstra:
+        use_voronoi = False
+    else:
+        use_voronoi = True  # 默认 Voronoi 更快
+
+    # Collect files
+    patterns = ["*.nii.gz", "*.nii"]
+    files = []
+    for p in patterns:
+        files.extend(glob.glob(os.path.join(args.input_dir, p)))
+    files = sorted(list(set(files)))
+    if not files:
+        print(f"[WARN] 输入目录中未找到 NIfTI：{args.input_dir}")
+        sys.exit(0)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"[Info] Using device: {device} ; files={len(files)} ; use_voronoi={use_voronoi}")
+
+    os.makedirs(args.out_debug_dir, exist_ok=True)
+    os.makedirs(args.out_merged_dir, exist_ok=True)
+
+    for i, f in enumerate(files, 1):
+        try:
+            info = process_one_file(
+                f, args.out_debug_dir, args.out_merged_dir,
+                use_voronoi=use_voronoi,
+                thresh=args.thresh,
+                skel_iters=args.skel_iters,
+                device=device,
+                save_centerline_r=True,
+                save_skeleton_prob=args.save_skeleton_prob,
+                use_dijkstra_connectivity=args.connectivity
+            )
+            print(f"[{i}/{len(files)}] Done: {os.path.basename(f)} | fg={info['fg_count']} -> "
+                  f"R_full: {os.path.basename(info['r_full'])} ; merged: {os.path.basename(info['merged'])}")
+        except Exception as e:
+            print(f"[{i}/{len(files)}] ERROR on {f}: {e}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+# 推荐（Voronoi 更快省显存）
+python batch_make_radius_maps.py \
+  --input_dir /path/to/labels_folder \
+  --out_debug_dir /path/to/debug_rmaps \
+  --out_merged_dir /path/to/merged_label_plus_r \
+  --use_voronoi \
+  --thresh 0.5 \
+  --skel_iters 40
+
+
+
+python batch_make_radius_maps.py \
+  --input_dir /path/to/labels_folder \
+  --out_debug_dir /path/to/debug_rmaps \
+  --out_merged_dir /path/to/merged_label_plus_r \
+  --use_voronoi \
+  --save_skeleton_prob
+
+
+
+python batch_make_radius_maps.py \
+  --input_dir /path/to/labels_folder \
+  --out_debug_dir /path/to/debug_rmaps \
+  --out_merged_dir /path/to/merged_label_plus_r \
+  --use_dijkstra --connectivity 26
+
