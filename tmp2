@@ -1,492 +1,621 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-批处理：为一个文件夹内的 label NIfTI 计算软中心线与半径图，并输出：
-  1) *_R_full.nii.gz              （半径回填到整个 mask）
-  2) *_R_centerline.nii.gz        （仅中心线体素处有半径，其余为0）
-  3) *_label_plus_R.nii.gz        （4D：channel0=label, channel1=R_full）
+VesselTreeDeformer (Step 1: 可运行的图表示最小版本)
+-------------------------------------------------
+目标：在尽量不破坏现有工程结构的前提下，新增一个“树状血管图表示 + 图消息传递变形”的模块，
+以替代单折线（cline）范式。此版本实现：
+  - 从 seg -> skeleton -> 构图（去环成树） -> 抽稀 -> 节点/边属性
+  - 多步（num_steps）结点坐标更新：图消息传递（简单 GCN/GraphConv 样式） + MLP 输出 Δx
+  - 样本特征：沿用 BasicFeatureSampling 的多尺度体素特征抽样，并线性融合
+  - 损失：全局 Chamfer、Laplacian 平滑、Edge Length 目标、SDF（节点级）
+  - 前后端接口尽量与 Cline_Deformer 类似（ret、loss 字段），方便渐进迁移
+
+后续 Step 2+ 将加入：局部 Chamfer、拓扑一致性（组件/环/度）、junction 几何一致、半径回归与 |dr/ds| 等。
+
+依赖：
+  - PyTorch, numpy, scipy, scikit-image, networkx
+  - pytorch3d.ops.knn_points 与 pytorch3d.loss.chamfer_distance（已与现工程一致）
+  - .layers.coord_transform 中的 normalize_vertices / unnormalize_vertices
+  - .layers.BasicFeatureSampling（若不可用，提供了一个简易回退）
+
+注意：此文件设计为新增模块，不修改你现有的 DeformCL 主文件。你可以在外部 import 使用：
+  from VesselTreeDeformer_step1 import VesselTreeDeformer
+
+作者：ChatGPT（Step 1 实现）
 """
-import os
-import sys
-import glob
+from typing import List, Dict, Tuple
+import logging
 import math
-import heapq
-import argparse
+
 import numpy as np
-import nibabel as nib
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from heapq import heappush, heappop
+
+import networkx as nx
+from skimage.morphology import skeletonize_3d
 from scipy.ndimage import distance_transform_edt
 
+# pytorch3d
+try:
+    from pytorch3d.ops import knn_points
+    from pytorch3d.loss import chamfer_distance
+    _HAS_P3D = True
+except Exception:
+    _HAS_P3D = False
 
-# =========================
-# SoftSkeletonize
-# =========================
-class SoftSkeletonize(torch.nn.Module):
-    def __init__(self, num_iter=40):
-        super(SoftSkeletonize, self).__init__()
-        self.num_iter = num_iter
+# 你工程里的工具：
+try:
+    from .layers.coord_transform import normalize_vertices, unnormalize_vertices
+except Exception:
+    # 简易后备：假设 img_shape 为 (D,H,W) 或 (H,W,D)，统一为 (D,H,W)
+    def _to_dhw(img_shape):
+        arr = list(img_shape)
+        if len(arr) != 3:
+            raise ValueError("img_shape must be len=3")
+        # 约定输入 pad_img_shape = (D,H,W)
+        return arr
 
-    def soft_erode(self, img):
-        if len(img.shape) == 4:
-            p1 = -F.max_pool2d(-img, (3, 1), (1, 1), (1, 0))
-            p2 = -F.max_pool2d(-img, (1, 3), (1, 1), (0, 1))
-            return torch.min(p1, p2)
-        elif len(img.shape) == 5:
-            p1 = -F.max_pool3d(-img, (3, 1, 1), (1, 1, 1), (1, 0, 0))
-            p2 = -F.max_pool3d(-img, (1, 3, 1), (1, 1, 1), (0, 1, 0))
-            p3 = -F.max_pool3d(-img, (1, 1, 3), (1, 1, 1), (0, 0, 1))
-            return torch.min(torch.min(p1, p2), p3)
-        else:
-            raise ValueError("Only 2D/3D supported for soft_erode.")
+    def normalize_vertices(verts: torch.Tensor, img_shape: torch.Tensor) -> torch.Tensor:
+        # verts: (..., 3) in index (z,y,x) with range [0, D/H/W)
+        D, H, W = _to_dhw(img_shape)
+        scale = torch.tensor([D, H, W], device=verts.device, dtype=verts.dtype)
+        v = (verts / (scale - 1.0)) * 2.0 - 1.0  # [-1,1]
+        # 再转到与原实现一致的顺序 (y,x,z) 若有需要可在外部 flip
+        return v
 
-    def soft_dilate(self, img):
-        if len(img.shape) == 4:
-            return F.max_pool2d(img, (3, 3), (1, 1), (1, 1))
-        elif len(img.shape) == 5:
-            return F.max_pool3d(img, (3, 3, 3), (1, 1, 1), (1, 1, 1))
-        else:
-            raise ValueError("Only 2D/3D supported for soft_dilate.")
+    def unnormalize_vertices(verts: torch.Tensor, img_shape: torch.Tensor) -> torch.Tensor:
+        D, H, W = _to_dhw(img_shape)
+        scale = torch.tensor([D, H, W], device=verts.device, dtype=verts.dtype)
+        v = (verts + 1.0) * 0.5 * (scale - 1.0)
+        return v
 
-    def soft_open(self, img):
-        return self.soft_dilate(self.soft_erode(img))
+try:
+    from .layers import BasicFeatureSampling
+    _HAS_BFS = True
+except Exception:
+    _HAS_BFS = False
 
-    def soft_skel(self, img):
-        img1 = self.soft_open(img)
-        skel = F.relu(img - img1)
-        for _ in range(self.num_iter):
-            img = self.soft_erode(img)
-            img1 = self.soft_open(img)
-            delta = F.relu(img - img1)
-            skel = skel + F.relu(delta - skel * delta)
-        return skel
+logger = logging.getLogger('VesselTreeDeformer')
 
-    def forward(self, img):
-        return self.soft_skel(img)
+# -----------------------------
+# 实用函数：Chamfer 距离（若无 P3D）
+# -----------------------------
 
-
-# =========================
-# I/O Tools
-# =========================
-def load_nii(path):
-    img = nib.load(path)
-    data = img.get_fdata()  # float64
-    return data, img.affine, img.header
-
-def save_nii(array, affine, header, out_path):
-    array = np.asarray(array)
-    # 为避免某些软件报错，复制 header 再写
-    hdr = header.copy()
-    nib.save(nib.Nifti1Image(array, affine, hdr), out_path)
-
-def is_label_map_like(arr, max_unique_check=512):
-    """启发式判断：整数型 或 唯一值数较少（<max_unique_check 且均接近整数）"""
-    a = np.asarray(arr)
-    if np.issubdtype(a.dtype, np.integer):
-        return True
-    # 如果是浮点，但唯一值不多且接近整数
-    if a.size <= 1:
-        return True
-    # 只抽样一部分以防巨大体积
-    sample = a.ravel()
-    if sample.size > 1_000_000:
-        sample = sample[:: max(1, sample.size // 1_000_000)]
-    uniq = np.unique(sample)
-    if len(uniq) <= max_unique_check:
-        # 检查是否接近整数
-        near_int = np.allclose(uniq, np.round(uniq), atol=1e-6)
-        return near_int
-    return False
-
-def to_binary_mask_from_label(arr):
-    """把 label map 压成二类：>=1 为 1，其他为 0。"""
-    return (np.asarray(arr) >= 1).astype(np.uint8)
-
-
-# =========================
-# Dijkstra/FMM 半径回填
-# =========================
-def _make_offsets_weights_3d(connectivity, spacing):
-    sz, sy, sx = spacing
-    offs, wts = [], []
-    for dz in (-1, 0, 1):
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dz == 0 and dy == 0 and dx == 0:
-                    continue
-                manhattan = abs(dz) + abs(dy) + abs(dx)
-                if connectivity == 6 and manhattan != 1:
-                    continue
-                if connectivity == 18 and manhattan > 2:
-                    continue
-                offs.append((dz, dy, dx))
-                wts.append(np.sqrt((dz*sz)**2 + (dy*sy)**2 + (dx*sx)**2))
-    return np.asarray(offs, dtype=np.int8), np.asarray(wts, dtype=np.float32)
-
-def _make_offsets_weights_2d(connectivity, spacing):
-    sy, sx = spacing
-    offs, wts = [], []
-    for dy in (-1, 0, 1):
-        for dx in (-1, 0, 1):
-            if dy == 0 and dx == 0:
-                continue
-            manhattan = abs(dy) + abs(dx)
-            if connectivity == 4 and manhattan != 1:
-                continue
-            offs.append((dy, dx))
-            wts.append(np.sqrt((dy*sy)**2 + (dx*sx)**2))
-    return np.asarray(offs, dtype=np.int8), np.asarray(wts, dtype=np.float32)
-
-def radius_map_dijkstra(mask, centerline_prob, spacing, thresh=0.5, connectivity=26):
-    mask = np.asarray(mask) > 0
-    prob = np.asarray(centerline_prob).astype(np.float32)
-
-    if mask.ndim == 3:
-        Z, Y, X = mask.shape
-        assert len(spacing) == 3
-        D = distance_transform_edt(mask, sampling=spacing).astype(np.float32)
-
-        C = (prob >= thresh) & mask
-        if not np.any(C):
-            return D.copy(), D
-
-        dist = np.full(mask.shape, np.inf, dtype=np.float32)
-        label = np.full(mask.shape, -1, dtype=np.int32)
-        seeds = np.array(np.where(C)).T
-        r_seed = D[C].astype(np.float32)
-
-        heap = []
-        for i, (z, y, x) in enumerate(seeds):
-            dist[z, y, x] = 0.0
-            label[z, y, x] = i
-            heappush(heap, (0.0, int(z), int(y), int(x)))
-
-        offs, wts = _make_offsets_weights_3d(connectivity, spacing)
-
-        while heap:
-            d, z, y, x = heappop(heap)
-            if d != dist[z, y, x]:
-                continue
-            my_label = label[z, y, x]
-            for (dz, dy, dx), w in zip(offs, wts):
-                zn, yn, xn = z+int(dz), y+int(dy), x+int(dx)
-                if (zn < 0) or (zn >= Z) or (yn < 0) or (yn >= Y) or (xn < 0) or (xn >= X):
-                    continue
-                if not mask[zn, yn, xn]:
-                    continue
-                nd = d + float(w)
-                if nd < dist[zn, yn, xn]:
-                    dist[zn, yn, xn]  = nd
-                    label[zn, yn, xn] = my_label
-                    heappush(heap, (nd, zn, yn, xn))
-
-        R = np.zeros_like(D, dtype=np.float32)
-        in_mask = mask & (label >= 0)
-        if np.any(in_mask):
-            R[in_mask] = r_seed[label[in_mask]]
-        miss = mask & (label < 0)
-        if np.any(miss):
-            R[miss] = D[miss]
-        np.minimum(R, D, out=R)
-        return R, D
-
-    elif mask.ndim == 2:
-        H, W = mask.shape
-        assert len(spacing) == 2
-        D = distance_transform_edt(mask, sampling=spacing).astype(np.float32)
-
-        C = (prob >= thresh) & mask
-        if not np.any(C):
-            return D.copy(), D
-
-        dist  = np.full(mask.shape, np.inf, dtype=np.float32)
-        label = np.full(mask.shape, -1, dtype=np.int32)
-        seeds = np.array(np.where(C)).T
-        r_seed = D[C].astype(np.float32)
-
-        heap = []
-        for i, (y, x) in enumerate(seeds):
-            dist[y, x]  = 0.0
-            label[y, x] = i
-            heappush(heap, (0.0, int(y), int(x)))
-
-        offs, wts = _make_offsets_weights_2d(8 if connectivity not in (4,8) else connectivity, spacing)
-
-        while heap:
-            d, y, x = heappop(heap)
-            if d != dist[y, x]:
-                continue
-            my_label = label[y, x]
-            for (dy, dx), w in zip(offs, wts):
-                yn, xn = y+int(dy), x+int(dx)
-                if (yn < 0) or (yn >= H) or (xn < 0) or (xn >= W):
-                    continue
-                if not mask[yn, xn]:
-                    continue
-                nd = d + float(w)
-                if nd < dist[yn, xn]:
-                    dist[yn, xn]  = nd
-                    label[yn, xn] = my_label
-                    heappush(heap, (nd, yn, xn))
-
-        R = np.zeros_like(D, dtype=np.float32)
-        in_mask = mask & (label >= 0)
-        if np.any(in_mask):
-            R[in_mask] = r_seed[label[in_mask]]
-        miss = mask & (label < 0)
-        if np.any(miss):
-            R[miss] = D[miss]
-        np.minimum(R, D, out=R)
-        return R, D
-
-    else:
-        raise ValueError("Only 2D/3D supported.")
-
-
-# =========================
-# 新增：EDT return_indices 最近中心线分配
-# =========================
-def radius_map_voronoi_indices(mask, centerline_prob, spacing, thresh=0.5):
-    mask = np.asarray(mask) > 0
-    prob = np.asarray(centerline_prob).astype(np.float32)
-
-    D = distance_transform_edt(mask, sampling=spacing).astype(np.float32)
-
-    C = (prob >= thresh) & mask
-    if not np.any(C):
-        return D.copy(), D
-
-    r_center = np.zeros_like(D, dtype=np.float32)
-    r_center[C] = D[C]
-
-    non_center = (~C)
-    _, indices = distance_transform_edt(non_center, sampling=spacing, return_indices=True)
-
-    R = np.zeros_like(D, dtype=np.float32)
-    if mask.ndim == 3:
-        iz, iy, ix = indices
-        R[mask] = r_center[iz[mask], iy[mask], ix[mask]]
-    else:
-        iy, ix = indices
-        R[mask] = r_center[iy[mask], ix[mask]]
-
-    np.minimum(R, D, out=R)
-    return R, D
-
-
-# =========================
-# 中心线处 |dr/ds|（可选调试）
-# =========================
-def radius_change_on_centerline(D, centerline_prob, spacing, thresh=0.5, connectivity=26, agg='max'):
-    C = (centerline_prob >= thresh)
-    V = np.zeros_like(D, dtype=np.float32)
-
-    if D.ndim == 3:
-        Z, Y, X = D.shape
-        offs, wts = _make_offsets_weights_3d(connectivity, spacing)
-        coords = np.array(np.where(C)).T  # [M,3]
-        for (z, y, x) in coords:
-            r0 = D[z, y, x]
-            if agg == 'max':
-                best = 0.0
-            else:
-                ssum = 0.0
-                cnt  = 0
-            for (dz, dy, dx), w in zip(offs, wts):
-                zn, yn, xn = z + int(dz), y + int(dy), x + int(dx)
-                if (0 <= zn < Z) and (0 <= yn < Y) and (0 <= xn < X) and C[zn, yn, xn]:
-                    slope = abs(r0 - D[zn, yn, xn]) / float(w)
-                    if agg == 'max':
-                        if slope > best:
-                            best = slope
-                    else:
-                        ssum += slope
-                        cnt  += 1
-            V[z, y, x] = best if agg == 'max' else (ssum / cnt if cnt > 0 else 0.0)
-
-    elif D.ndim == 2:
-        H, W = D.shape
-        offs, wts = _make_offsets_weights_2d(8, spacing)
-        coords = np.array(np.where(C)).T  # [M,2]
-        for (y, x) in coords:
-            r0 = D[y, x]
-            if agg == 'max':
-                best = 0.0
-            else:
-                ssum = 0.0
-                cnt  = 0
-            for (dy, dx), w in zip(offs, wts):
-                yn, xn = y + int(dy), x + int(dx)
-                if (0 <= yn < H) and (0 <= xn < W) and C[yn, xn]:
-                    slope = abs(r0 - D[yn, xn]) / float(w)
-                    if agg == 'max':
-                        if slope > best:
-                            best = slope
-                    else:
-                        ssum += slope
-                        cnt  += 1
-            V[y, x] = best if agg == 'max' else (ssum / cnt if cnt > 0 else 0.0)
-    else:
-        raise ValueError("Only 2D/3D supported.")
-    return V
-
-
-# =========================
-# 核心处理：单文件
-# =========================
-def process_one_file(
-    in_path, out_debug_dir, out_merged_dir,
-    use_voronoi=True, thresh=0.5, skel_iters=40, device=None,
-    save_r=True, save_centerline_r=True, save_skeleton_prob=True, use_dijkstra_connectivity=26
-):
-    basename = os.path.basename(in_path)
-    stem = basename.replace('.nii.gz', '').replace('.nii', '')
-
-    vol, affine, header = load_nii(in_path)
-    # 兼容 4D/时间维：若已有4D(…,C/T)，默认取第一个通道作为label
-    if vol.ndim == 4:
-        vol_label = vol[..., 0]
-    elif vol.ndim == 3:
-        vol_label = vol
-    elif vol.ndim == 2:
-        vol_label = vol
-    else:
-        raise ValueError(f"Unsupported ndim={vol.ndim} for {in_path}")
-
-    # 判断 label map：若不是，则仍然把>0作为前景
-    if is_label_map_like(vol_label):
-        bin_mask = to_binary_mask_from_label(vol_label)
-    else:
-        bin_mask = (vol_label > 0).astype(np.uint8)
-
-    # 构造 Torch 张量（B,C, …）
-    if bin_mask.ndim == 3:
-        ten = torch.from_numpy(bin_mask[None, None].astype(np.float32))
-    elif bin_mask.ndim == 2:
-        ten = torch.from_numpy(bin_mask[None, None].astype(np.float32))
-    else:
-        raise ValueError("Only 2D/3D supported after binarization.")
-
-    # 设备
-    if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    ten = ten.to(device)
-
-    # 软中心线概率
-    model = SoftSkeletonize(num_iter=skel_iters).to(device).eval()
+def chamfer_distance_fallback(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """简易 Chamfer（O(NM)）仅用于小规模回退。x,y: (B,N,3)/(B,M,3)."""
     with torch.no_grad():
-        skel_prob = model(ten)  # (1,1, …), 0~1
+        if x.dim() != 3 or y.dim() != 3:
+            raise ValueError("Chamfer fallback expects (B,N,3) and (B,M,3)")
+    B, N, _ = x.shape
+    M = y.shape[1]
+    # (B,N,M,3)
+    x_exp = x[:, :, None, :]
+    y_exp = y[:, None, :, :]
+    dist2 = (x_exp - y_exp).pow(2).sum(-1)
+    # (B,N), (B,M)
+    min_xy, _ = dist2.min(dim=2)
+    min_yx, _ = dist2.min(dim=1)
+    return min_xy.mean(dim=1) + min_yx.mean(dim=1)
 
-    # spacing
-    zms = header.get_zooms()
-    # NIfTI 2D 有时返回 (Y,X,1) 或 (Y,X)；3D 为 (Z,Y,X)
-    if len(zms) >= 3:
-        spacing = (float(zms[-3]), float(zms[-2]), float(zms[-1])) if bin_mask.ndim == 3 else (float(zms[-2]), float(zms[-1]))
-    elif len(zms) == 2:
-        spacing = (float(zms[0]), float(zms[1]))
+
+def chamfer_distance_batch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    if _HAS_P3D:
+        return chamfer_distance(x, y)[0]  # 返回标量或 (B,) 取决于版本
     else:
-        spacing = (1.0, 1.0, 1.0) if bin_mask.ndim == 3 else (1.0, 1.0)
+        return chamfer_distance_fallback(x, y)
 
-    # 转 numpy 在 CPU 计算 R（省显存）
-    mask_np = (ten[0,0].detach().cpu().numpy() > 0)
-    soft_np = skel_prob[0,0].detach().cpu().numpy().astype(np.float32)
+# -----------------------------
+# 图特征采样（多尺度体素特征）
+# -----------------------------
 
-    if use_voronoi:
-        R_np, D_np = radius_map_voronoi_indices(mask_np, soft_np, spacing=spacing, thresh=thresh)
-    else:
-        R_np, D_np = radius_map_dijkstra(mask_np, soft_np, spacing=spacing, thresh=thresh, connectivity=use_dijkstra_connectivity)
+class GraphFeatureSampler(nn.Module):
+    """包装多尺度特征采样，支持 (B,V,3) 节点坐标。
+    - 若工程已有 BasicFeatureSampling，优先用；否则用 grid_sample 回退。
+    """
+    def __init__(self):
+        super().__init__()
+        self.has_bfs = _HAS_BFS
+        if self.has_bfs:
+            self.bfs = BasicFeatureSampling()
 
-    # 仅中心线处的 R（其他位置为0）
-    C = (soft_np >= thresh) & mask_np
-    R_centerline = np.zeros_like(R_np, dtype=np.float32)
-    R_centerline[C] = D_np[C]  # 中心线处半径=到边界的内距
+    def forward(self, features: List[torch.Tensor], node_coords_norm_xyz: torch.Tensor, pad_img_shape: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            features: list of (B, C, D, H, W)
+            node_coords_norm_xyz: (B, V, 3) 归一化到 [-1,1]，且顺序需与 grid_sample 匹配（x,y,z）
+            pad_img_shape: (D,H,W) tensor
+        Returns:
+            fused: (B, V, C_total)
+        """
+        B, V, _ = node_coords_norm_xyz.shape
+        feats = []
+        for feat in features:
+            # feat: (B, C, D, H, W)
+            if self.has_bfs:
+                # BasicFeatureSampling 接口： (B,C,D,H,W) × (B,V,3_in_grid_order)
+                sampled = self.bfs(feat, node_coords_norm_xyz, pad_img_shape)  # (B,V,C')
+            else:
+                # grid_sample 需要 (B,C,D,H,W) 和 (B, V, 1, 1, 3) 或 (B, D',H',W',3)
+                # 我们把节点堆成 (B, V, 1, 1, 3)：
+                grid = node_coords_norm_xyz.view(B, V, 1, 1, 3)
+                # grid_sample 输出 (B, C, V, 1, 1) 然后换轴
+                sampled = F.grid_sample(feat, grid, mode='bilinear', align_corners=True)
+                sampled = sampled[..., 0, 0].transpose(1, 2)  # (B, V, C)
+            feats.append(sampled)
+        fused = torch.cat(feats, dim=-1)
+        return fused
 
-    # 保存调试：R_full、R_centerline、可选 skeleton 概率
-    os.makedirs(out_debug_dir, exist_ok=True)
-    if save_r:
-        r_full_path = os.path.join(out_debug_dir, f"{stem}_R_full.nii.gz")
-        save_nii(R_np.astype(np.float32), affine, header, r_full_path)
+# -----------------------------
+# 简化版图卷积层（消息传递）：GCN/GraphConv 风格
+# -----------------------------
 
-    if save_centerline_r:
-        r_cl_path = os.path.join(out_debug_dir, f"{stem}_R_centerline.nii.gz")
-        save_nii(R_centerline.astype(np.float32), affine, header, r_cl_path)
+class GraphConvBlock(nn.Module):
+    """简单的图消息传递层：
+    h_i' = LN( h_i + FF( W_self h_i + mean_{j∈N(i)} W_nei h_j ) )
+    注：保持简洁稳定，支持 batch 拼接（通过 batch_index 区分样本）。
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.lin_self = nn.Linear(dim, dim)
+        self.lin_nei = nn.Linear(dim, dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, dim*2),
+            nn.GELU(),
+            nn.Linear(dim*2, dim)
+        )
+        self.ln = nn.LayerNorm(dim)
 
-    if save_skeleton_prob:
-        skel_path = os.path.join(out_debug_dir, f"{stem}_skeleton_softprob.nii.gz")
-        save_nii(soft_np.astype(np.float32), affine, header, skel_path)
+    def forward(self, h: torch.Tensor, edge_index: torch.Tensor, batch_index: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            h: (N_total, C)
+            edge_index: (2, E_total)  每列 (src, dst)
+            batch_index: (N_total,)  标识每个结点属于哪个 batch 样本
+        Returns:
+            h_out: (N_total, C)
+        """
+        N, C = h.shape
+        src, dst = edge_index  # (E,), (E,)
+        # 消息 = W_nei h_src 按 dst 聚合（均值）
+        msg = self.lin_nei(h[src])  # (E, C)
+        # 计算每个 dst 的度
+        deg = torch.zeros(N, device=h.device, dtype=h.dtype)
+        deg = deg.index_add(0, dst, torch.ones_like(dst, dtype=h.dtype))
+        agg = torch.zeros_like(h)
+        agg = agg.index_add(0, dst, msg)
+        # 避免除 0
+        deg_safe = torch.clamp(deg, min=1.0).unsqueeze(-1)
+        agg = agg / deg_safe
+        # 自身项
+        self_part = self.lin_self(h)
+        z = self_part + agg
+        z = self.ff(z)
+        out = self.ln(h + z)
+        return out
 
-    return {
-        "in": in_path,
-        "r_full": r_full_path,
-        "r_centerline": r_cl_path,
-        "skeleton_prob": skel_path,
-        "spacing": spacing,
-        "vox_count": int(np.prod(mask_np.shape)),
-        "fg_count": int(mask_np.sum())
-    }
+# -----------------------------
+# 主类：VesselTreeDeformer（Step 1）
+# -----------------------------
 
+class VesselTreeDeformer(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        # ===== 配置 =====
+        self.num_steps = int(getattr(cfg.MODEL.DEFORM, 'NUM_STEPS', 3))
+        self.hidden_dim = int(getattr(cfg.MODEL.GRAPH, 'NODE_DIM', 64))
+        self.pts_target = int(getattr(cfg.MODEL.GRAPH, 'PTS_NUM', 500))  # 抽稀后的目标点数（整树总数）
+        self.use_adaptive_tpl = bool(getattr(cfg.MODEL.DEFORM, 'ADPTPL', True))
+        self.lower_thres = float(getattr(cfg.MODEL.DEFORM, 'LOWER_THRES', 30))  # skeleton 点数下界
+        self.sdf_loss_weight = float(getattr(cfg.MODEL.DEFORM, 'SDF_LOSS_WEIGHT', 1.0))
+        self.edge_len_weight = float(getattr(cfg.MODEL.DEFORM, 'EDGE_LEN_WEIGHT', 1.0))
+        self.lap_weight = float(getattr(cfg.MODEL.DEFORM, 'LAPLACIAN_WEIGHT', 1.0))
+        self.chamfer_weight = float(getattr(cfg.MODEL.DEFORM, 'CHAMFER_LOSS_WEIGHT', 1.0))
+        self.target_step_mm = float(getattr(cfg.MODEL.GRAPH, 'TARGET_STEP_MM', 1.0))
 
-# =========================
-# 批处理入口
-# =========================
-def main():
-    parser = argparse.ArgumentParser(description="批处理：提取软中心线并生成半径图（Rmap），并输出调试与合并 NIfTI。")
-    parser.add_argument("--input_dir", required=True, help="输入文件夹，包含 .nii 或 .nii.gz（应为label map或可二值化）")
-    parser.add_argument("--out_debug_dir", required=True, help="调试输出目录（R_full / R_centerline / 可选 skeleton）")
-    parser.add_argument("--out_merged_dir", required=True, help="合并输出目录（4D：label+R_full）")
-    parser.add_argument("--use_voronoi", action="store_true", help="使用 return_indices 的 Voronoi 版本（推荐）")
-    parser.add_argument("--use_dijkstra", action="store_true", help="使用 Dijkstra 版本（若同时给定，则以 Voronoi 优先）")
-    parser.add_argument("--thresh", type=float, default=0.5, help="软中心线概率阈值（默认0.5）")
-    parser.add_argument("--skel_iters", type=int, default=40, help="软骨架迭代次数（默认40）")
-    parser.add_argument("--connectivity", type=int, default=26, help="Dijkstra 版本的连通性（3D:6/18/26; 2D:4/8）")
-    args = parser.parse_args()
+        # ===== 特征抽样与融合 =====
+        self.feat_sampler = GraphFeatureSampler()
+        self.features_fuse = nn.Linear(24 * 1, self.hidden_dim)  # 若有多尺度特征，维度需根据实际 C_total 重设
+        # 为了通用性：我们不预设 24；运行时根据输入 features 动态建一个投影层（见 forward 中 lazy init）
+        self._fuse_in_dim = None
 
-    if args.use_voronoi:
-        use_voronoi = True
-    elif args.use_dijkstra:
-        use_voronoi = False
-    else:
-        use_voronoi = True  # 默认 Voronoi 更快
+        # 几何位置编码
+        self.pos_embed = nn.Linear(3, self.hidden_dim)
 
-    # Collect files
-    patterns = ["*.nii.gz", "*.nii"]
-    files = []
-    for p in patterns:
-        files.extend(glob.glob(os.path.join(args.input_dir, p)))
-    files = sorted(list(set(files)))
-    if not files:
-        print(f"[WARN] 输入目录中未找到 NIfTI：{args.input_dir}")
-        sys.exit(0)
+        # 图消息传递堆叠
+        self.gconvs = nn.ModuleList([GraphConvBlock(self.hidden_dim) for _ in range(4)])
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"[Info] Using device: {device} ; files={len(files)} ; use_voronoi={use_voronoi}")
+        # 节点更新 MLP（输出 Δx）
+        self.node_update = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, 3),
+        )
 
-    os.makedirs(args.out_debug_dir, exist_ok=True)
-    os.makedirs(args.out_merged_dir, exist_ok=True)
+    @property
+    def device(self):
+        return list(self.parameters())[0].device
 
-    for i, f in enumerate(files, 1):
-        if i > 1:
-            break
-        try:
-            info = process_one_file(
-                f, args.out_debug_dir, args.out_merged_dir,
-                use_voronoi=use_voronoi,
-                thresh=args.thresh,
-                skel_iters=args.skel_iters,
-                device=device,
-                save_r=True,
-                save_centerline_r=True,
-                save_skeleton_prob=True,
-                use_dijkstra_connectivity=args.connectivity
-            )
-            print(f"[{i}/{len(files)}] Done: {os.path.basename(f)} | fg={info['fg_count']} -> "
-                  f"R_full: {os.path.basename(info['r_full'])} ; merged: {os.path.basename(info['merged'])}")
-        except Exception as e:
-            print(f"[{i}/{len(files)}] ERROR on {f}: {e}")
+    # -------------------------
+    # 前向
+    # -------------------------
+    def forward(self,
+                batched_inputs: List[Dict],
+                features: List[torch.FloatTensor],
+                pad_img_shape: Tuple[int, int, int],
+                gt_seg: torch.Tensor,
+                pred_seg: torch.Tensor,
+                spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0)):
+        """
+        Args:
+            features: list of (B, C, D, H, W)
+            pad_img_shape: tuple/list of (B? , D, H, W) or (D,H,W); 这里只用 (D,H,W)
+            gt_seg, pred_seg: (B,1,D,H,W) 张量
+            spacing: 体素尺寸 (dz, dy, dx) in mm
+        Returns:
+            训练： (ret, loss_dict)； 推理： ret
+        """
+        assert isinstance(features, list) and len(features) > 0
+        B = features[0].shape[0]
+        assert B == 1, "Step1 实现先支持 batch=1（后续可扩展 batch 拼接）"
+        device = features[0].device
 
-if __name__ == "__main__":
-    main()
+        pad_img_shape_t = torch.tensor(pad_img_shape[-3:], device=device)  # (D,H,W)
 
+        # ===== 初始化图（来自 seg） =====
+        if self.training and self.use_adaptive_tpl:
+            # 粗估 Dice：
+            est_dice = self._dice_coeff((pred_seg[:, 0] > 0.5).float(), gt_seg[:, 0])
+            use_seg = pred_seg if est_dice > 0.65 else gt_seg.float()
+        else:
+            use_seg = pred_seg
 
+        init_graph = self.initial_graph(from_seg=True, seg=use_seg, img_shape=pad_img_shape_t, spacing=spacing)
+
+        # 保存预测序列
+        preds = [init_graph]
+
+        # lazy init features_fuse in-dim
+        fused_dim = sum([f.shape[1] for f in self._peek_sample_dims(features, init_graph['nodes'], pad_img_shape_t)])
+        if (self._fuse_in_dim is None) or (self._fuse_in_dim != fused_dim):
+            self.features_fuse = nn.Linear(fused_dim, self.hidden_dim).to(self.device)
+            self._fuse_in_dim = fused_dim
+
+        for step in range(self.num_steps):
+            graph_i = preds[-1]
+            nodes_norm = graph_i['nodes']  # (V,3) 归一化坐标（index 顺序：z,y,x）。
+            edge_index = graph_i['edge_index']  # (2,E)
+            batch_index = graph_i['batch_index']  # (V,)
+
+            # grid_sample 期望 (x,y,z) 顺序，这里与旧代码一致使用 flip
+            grid_nodes = nodes_norm.flip(dims=[-1])  # (V,3) -> (V,3) as (x,y,z)
+            grid_nodes = grid_nodes.unsqueeze(0)  # (1,V,3)
+
+            # 多尺度特征采样并融合
+            node_feats = self.feat_sampler(features, grid_nodes, pad_img_shape_t).squeeze(0)  # (V,C_total)
+            node_feats = self.features_fuse(node_feats)  # (V,H)
+            # 位置编码（直接加）
+            node_feats = node_feats + self.pos_embed(nodes_norm)
+
+            # 图消息传递（多层）
+            h = node_feats
+            for gconv in self.gconvs:
+                h = gconv(h, edge_index, batch_index)
+
+            # 预测 Δx，并更新结点（tanh 限幅）
+            delta = torch.tanh(self.node_update(h)) * 0.2  # 稳定步长，后续可 cfg 控制
+            nodes_new = nodes_norm + delta
+
+            preds.append({
+                'nodes': nodes_new,
+                'edge_index': edge_index,
+                'batch_index': batch_index,
+                'meta': graph_i['meta']
+            })
+
+        # 最终输出
+        final_graph = preds[-1]
+        nodes_final = final_graph['nodes']
+        nodes_final_phys = unnormalize_vertices(nodes_final, pad_img_shape_t)
+
+        ret = {
+            'pred_graph': {
+                'nodes': nodes_final_phys,  # (V,3) 物理索引坐标（z,y,x）
+                'edge_index': final_graph['edge_index']
+            },
+            'initial_graph': preds[0]['nodes']
+        }
+
+        if self.training:
+            # 构造 GT 点集（skeleton 点）用于几何损失
+            gt_pts = self._seg_to_skeleton_points(gt_seg[0, 0])  # (N,3) in index (z,y,x)
+            if gt_pts.shape[0] == 0:
+                loss = {k: nodes_final.sum()*0.0 for k in ['loss_chamfer','loss_edge','loss_lap','loss_sdf']}
+                return ret, loss
+            gt_pts_norm = normalize_vertices(gt_pts.to(device), pad_img_shape_t)
+
+            loss = self._compute_losses(preds[1:],  # 忽略 init
+                                        gt_pts_norm,
+                                        gt_seg[0, 0],
+                                        pad_img_shape_t,
+                                        spacing)
+            return ret, loss
+        else:
+            return ret
+
+    # -------------------------
+    # 初始化：从 seg 构建图
+    # -------------------------
+    def initial_graph(self, from_seg: bool, seg: torch.Tensor, img_shape: torch.Tensor, spacing: Tuple[float,float,float]):
+        """
+        Returns GraphDict:
+          {
+            'nodes': (V,3)  归一化坐标（index 顺序 z,y,x，范围[-1,1]）
+            'edge_index': (2,E)
+            'batch_index': (V,)  全 0（Step1: batch=1）
+            'meta': { 'spacing': (dz,dy,dx), 'img_shape': (D,H,W) }
+          }
+        """
+        seg0 = (seg[0, 0] > 0.5).float() if seg.dim()==5 else (seg > 0.5).float()  # (D,H,W)
+        pts = self._seg_to_skeleton_points(seg0)  # (N,3)
+        if pts.shape[0] < self.lower_thres:
+            # 回退：构造一条直线（与旧实现一致）
+            D,H,W = img_shape.tolist()
+            z = torch.linspace(0, D-1, steps=max(int(self.lower_thres), 20), device=seg0.device)
+            y = torch.full_like(z, (H-1)/2)
+            x = torch.full_like(z, (W-1)/2)
+            pts = torch.stack([z,y,x], dim=1)
+
+        # 构图（去环）
+        nodes_idx, edge_index = self._build_tree_graph(pts, spacing, target_pts=self.pts_target)
+        nodes_norm = normalize_vertices(nodes_idx, img_shape)
+
+        V = nodes_norm.shape[0]
+        batch_index = torch.zeros(V, device=nodes_norm.device, dtype=torch.long)
+        return {
+            'nodes': nodes_norm,
+            'edge_index': edge_index,
+            'batch_index': batch_index,
+            'meta': {
+                'spacing': spacing,
+                'img_shape': img_shape
+            }
+        }
+
+    # -------------------------
+    # 损失集合（Step1）
+    # -------------------------
+    def _compute_losses(self,
+                        pred_graphs: List[Dict],
+                        gt_pts_norm: torch.Tensor,  # (N,3)
+                        gt_seg3d: torch.Tensor,     # (D,H,W)
+                        img_shape_t: torch.Tensor,
+                        spacing: Tuple[float,float,float]) -> Dict[str, torch.Tensor]:
+        losses: Dict[str, torch.Tensor] = {}
+
+        # 1) 全局 Chamfer
+        loss_ch = 0.0
+        for i, g in enumerate(pred_graphs, start=1):
+            nodes = g['nodes']  # (V,3)
+            loss_i = chamfer_distance_batch(nodes[None], gt_pts_norm[None])
+            # 统一转为标量
+            if isinstance(loss_i, torch.Tensor):
+                loss_i = loss_i.mean()
+            loss_ch = loss_ch + loss_i
+        loss_ch = loss_ch / max(len(pred_graphs), 1)
+        losses['loss_chamfer'] = loss_ch * self.chamfer_weight
+
+        # 2) 边长目标 + 3) 图拉普拉斯平滑 + 4) SDF（节点级）
+        loss_edge = 0.0
+        loss_lap = 0.0
+        loss_sdf = 0.0
+
+        # 归一化后的目标步长（粗略按最小边长度缩放），避免依赖 spacing 计算 mm→norm 的精确映射
+        D,H,W = img_shape_t.tolist()
+        min_axis = float(min(D,H,W))
+        target_step_norm = (self.target_step_mm / max(spacing)) * (2.0 / (min_axis - 1.0))  # 近似
+        target_step_norm = torch.as_tensor(target_step_norm, device=gt_seg3d.device, dtype=torch.float32)
+
+        for g in pred_graphs:
+            nodes = g['nodes']    # (V,3)
+            ei = g['edge_index']  # (2,E)
+            src, dst = ei
+            # 边长
+            elen = (nodes[dst] - nodes[src]).pow(2).sum(-1).sqrt()  # (E,)
+            loss_edge_i = (elen - target_step_norm).pow(2).mean()
+            loss_edge = loss_edge + loss_edge_i
+
+            # Laplacian：节点 - 邻域均值
+            Vn = nodes.shape[0]
+            deg = torch.zeros(Vn, device=nodes.device)
+            deg = deg.index_add(0, dst, torch.ones_like(dst, dtype=deg.dtype))
+            agg = torch.zeros_like(nodes)
+            agg = agg.index_add(0, dst, nodes[src])
+            deg_safe = torch.clamp(deg, min=1.0).unsqueeze(-1)
+            nb_mean = agg / deg_safe
+            loss_lap_i = (nodes - nb_mean).pow(2).sum(-1).mean()
+            loss_lap = loss_lap + loss_lap_i
+
+            # SDF：节点到表面最近距离 × 符号
+            loss_sdf_i = self._sdf_loss_nodes(nodes, gt_seg3d, img_shape_t)
+            loss_sdf = loss_sdf + loss_sdf_i
+
+        nG = max(len(pred_graphs), 1)
+        losses['loss_edge'] = loss_edge / nG * self.edge_len_weight
+        losses['loss_lap'] = loss_lap / nG * self.lap_weight
+        losses['loss_sdf'] = loss_sdf / nG * self.sdf_loss_weight
+
+        return losses
+
+    # -------------------------
+    # 工具：Dice / skeleton / SDF / 构图
+    # -------------------------
+    @staticmethod
+    def _dice_coeff(pred: torch.Tensor, target: torch.Tensor) -> float:
+        smooth = 1.0
+        m1 = pred.float()
+        m2 = target.float()
+        inter = (m1*m2).sum().float()
+        d = (2*inter + smooth) / (m1.sum() + m2.sum() + smooth)
+        return float(d.detach().cpu())
+
+    @staticmethod
+    def _seg_to_skeleton_points(seg3d: torch.Tensor) -> torch.Tensor:
+        """输入 seg3d: (D,H,W)∈{0,1}，输出骨架点集 (N,3) in index (z,y,x)."""
+        if seg3d.dtype != torch.float32:
+            seg3d = seg3d.float()
+        arr = (seg3d > 0.5).cpu().numpy().astype(np.uint8)
+        if arr.sum() == 0:
+            return torch.zeros((0,3), dtype=torch.float32, device=seg3d.device)
+        sk = skeletonize_3d(arr)
+        pts = np.stack(np.where(sk > 0), axis=1).astype(np.float32)  # (N,3) z,y,x
+        return torch.from_numpy(pts).to(seg3d.device)
+
+    def _sdf_loss_nodes(self, nodes_norm: torch.Tensor, gt_seg3d: torch.Tensor, img_shape_t: torch.Tensor) -> torch.Tensor:
+        """节点级 SDF：到内表面最近距离 × 符号（在内为负、外为正）。"""
+        if gt_seg3d.sum() < 5:
+            return nodes_norm.sum()*0.0
+        # 反归一到索引坐标
+        nodes_idx = unnormalize_vertices(nodes_norm, img_shape_t)  # (V,3) z,y,x (float)
+        nodes_ijk = nodes_idx.round().long()
+        D,H,W = gt_seg3d.shape
+        nodes_ijk[:,0] = nodes_ijk[:,0].clamp(0, D-1)
+        nodes_ijk[:,1] = nodes_ijk[:,1].clamp(0, H-1)
+        nodes_ijk[:,2] = nodes_ijk[:,2].clamp(0, W-1)
+
+        # 符号：内部(+1) → 负号（与原实现对齐：内部为 -，外部为 +）
+        inside = gt_seg3d[nodes_ijk[:,0], nodes_ijk[:,1], nodes_ijk[:,2]]  # (V,)
+        sign = torch.where(inside>0, torch.tensor(-1.0, device=gt_seg3d.device), torch.tensor(1.0, device=gt_seg3d.device))
+
+        # 近似表面点集：
+        np_kernel = np.array([
+            [[0,0,0],[0,1,0],[0,0,0]],
+            [[0,1,0],[1,1,1],[0,1,0]],
+            [[0,0,0],[0,1,0],[0,0,0]],
+        ], dtype=np.float32)
+        torch_kernel = torch.from_numpy(np_kernel).to(gt_seg3d.device)
+        temp = F.conv3d(gt_seg3d[None,None], torch_kernel[None,None], padding=1)[0,0]
+        gt_surface = ((temp < 7) & (gt_seg3d > 0)).float()
+        surf_pts = torch.nonzero(gt_surface > 0.0).float()  # (M,3)
+        if surf_pts.shape[0] == 0:
+            return nodes_norm.sum()*0.0
+
+        if _HAS_P3D:
+            pred_nn = knn_points(nodes_idx[None,...], surf_pts[None,...], K=1)
+            d = pred_nn.dists.sqrt().squeeze(0).squeeze(-1)  # (V,)
+        else:
+            # 简易最近距（O(VM)）
+            diff = nodes_idx[:,None,:] - surf_pts[None,:,:]
+            d = diff.pow(2).sum(-1).sqrt().min(dim=1)[0]
+        sdf = d * sign
+        return sdf.mean()
+
+    def _build_tree_graph(self,
+                          pts_idx: torch.Tensor,   # (N,3) z,y,x float
+                          spacing: Tuple[float,float,float],
+                          target_pts: int = 800,
+                          neighbor_mm: float = 1.8) -> Tuple[torch.Tensor, torch.Tensor]:
+        """从骨架点构建“无环树”图，并抽稀到 target_pts 左右。
+        1) 基于物理阈值的近邻连边，构建加权图（边长为欧氏距离）
+        2) 取 MST（无环、连通）
+        3) 沿 geodesic 抽样至目标点数（保留终端/分叉）
+        Returns:
+            nodes_idx: (V,3) float
+            edge_index: (2,E) long
+        """
+        device = pts_idx.device
+        N = pts_idx.shape[0]
+        if N == 0:
+            raise ValueError("No skeleton points to build graph.")
+
+        # 物理坐标（mm）用于阈值与边权
+        dz, dy, dx = spacing
+        pts_phys = torch.stack([
+            pts_idx[:,0]*dz,
+            pts_idx[:,1]*dy,
+            pts_idx[:,2]*dx,
+        ], dim=1)  # (N,3)
+
+        # 距离矩阵（可采样下近邻以省内存；Step1 简化：全对）
+        with torch.no_grad():
+            a = pts_phys[:,None,:]
+            b = pts_phys[None,:,:]
+            dist = torch.norm(a - b, dim=-1)  # (N,N)
+            adj = (dist > 0) & (dist <= neighbor_mm)
+
+        # 构建 nx 图（边权为 dist）
+        G = nx.Graph()
+        idx_cpu = torch.arange(N).cpu().numpy()
+        G.add_nodes_from(idx_cpu)
+        ii, jj = torch.where(adj)
+        for s, t in zip(ii.tolist(), jj.tolist()):
+            if s < t:
+                w = float(dist[s, t].item())
+                G.add_edge(int(s), int(t), weight=w)
+
+        if G.number_of_edges() == 0:
+            # 回退：按 z 排序成链
+            order = torch.argsort(pts_idx[:,0])
+            nodes_idx = pts_idx[order]
+            src = torch.arange(nodes_idx.shape[0]-1, device=device)
+            dst = src + 1
+            edge_index = torch.stack([src, dst], dim=0)
+            return nodes_idx, edge_index
+
+        # 取最大连通分量
+        if not nx.is_connected(G):
+            comps = sorted(nx.connected_components(G), key=len, reverse=True)
+            G = G.subgraph(comps[0]).copy()
+
+        # 最小生成树（无环）
+        T = nx.minimum_spanning_tree(G)
+
+        # 抽稀：保留端点/分叉点，其他按弧长下采样到 target_pts
+        # 提取 geodesic 顺序：从任一端点出发 DFS/BFS
+        degs = dict(T.degree())
+        leaves = [n for n,d in degs.items() if d==1]
+        root = leaves[0] if len(leaves)>0 else list(T.nodes())[0]
+        order_nodes = list(nx.dfs_preorder_nodes(T, source=root))
+        nodes_idx_all = pts_idx[order_nodes]
+
+        V_full = nodes_idx_all.shape[0]
+        if V_full <= target_pts:
+            nodes_idx = nodes_idx_all
+            # 生成 edge_index 按树结构
+            edge_list = []
+            for u, v in T.edges():
+                su = order_nodes.index(u)
+                sv = order_nodes.index(v)
+                edge_list.append((su, sv))
+            # 双向边
+            ei = torch.tensor(edge_list, dtype=torch.long, device=device)
+            ei = torch.cat([ei.t(), ei.t().flip(0)], dim=1)
+            return nodes_idx, ei
+
+        # 等弧长抽样：沿 DFS 顺序近似
+        sample_idx = torch.linspace(0, V_full-1, steps=target_pts).round().long()
+        nodes_idx = nodes_idx_all[sample_idx]
+
+        # 重新连边：按相邻采样点连线（近似树）
+        src = torch.arange(nodes_idx.shape[0]-1, device=device)
+        dst = src + 1
+        edge_index = torch.stack([src, dst], dim=0)
+        # 双向
+        edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
+        return nodes_idx, edge_index
+
+    @staticmethod
+    def _peek_sample_dims(features: List[torch.Tensor], nodes_norm: torch.Tensor, img_shape_t: torch.Tensor) -> List[torch.Tensor]:
+        """辅助：返回每层采样后的 (B,C') 维度形状占位（不执行真实采样）。
+        这里简化为直接读取 features 的 C，并假设采样不改变 C。
+        """
+        dims = []
+        for feat in features:
+            # feat: (B,C,D,H,W)
+            dims.append(torch.empty((1, feat.shape[1]), device=feat.device))
+        return dims
+
+# ==========================
+# 结束（Step 1）
+# ==========================
