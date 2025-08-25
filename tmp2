@@ -338,7 +338,7 @@ def radius_change_on_centerline(D, centerline_prob, spacing, thresh=0.5, connect
 def process_one_file(
     in_path, out_debug_dir, out_merged_dir,
     use_voronoi=True, thresh=0.5, skel_iters=40, device=None,
-    save_centerline_r=True, save_skeleton_prob=False, use_dijkstra_connectivity=26
+    save_r=True, save_centerline_r=True, save_skeleton_prob=True, use_dijkstra_connectivity=26
 ):
     basename = os.path.basename(in_path)
     stem = basename.replace('.nii.gz', '').replace('.nii', '')
@@ -405,37 +405,23 @@ def process_one_file(
 
     # 保存调试：R_full、R_centerline、可选 skeleton 概率
     os.makedirs(out_debug_dir, exist_ok=True)
-    r_full_path = os.path.join(out_debug_dir, f"{stem}_R_full.nii.gz")
-    save_nii(R_np.astype(np.float32), affine, header, r_full_path)
+    if save_r:
+        r_full_path = os.path.join(out_debug_dir, f"{stem}_R_full.nii.gz")
+        save_nii(R_np.astype(np.float32), affine, header, r_full_path)
 
-    r_cl_path = None
     if save_centerline_r:
         r_cl_path = os.path.join(out_debug_dir, f"{stem}_R_centerline.nii.gz")
         save_nii(R_centerline.astype(np.float32), affine, header, r_cl_path)
 
-    skel_path = None
     if save_skeleton_prob:
         skel_path = os.path.join(out_debug_dir, f"{stem}_skeleton_softprob.nii.gz")
         save_nii(soft_np.astype(np.float32), affine, header, skel_path)
-
-    # 合并输出：4D 通道 [label, R_full]
-    os.makedirs(out_merged_dir, exist_ok=True)
-    # label 先保持原 dtype（常为整型），R 用 float32；为了一致性，最终 4D 使用 float32
-    lbl = (vol_label).astype(np.float32)
-    if lbl.ndim == 2:
-        merged = np.stack([lbl, R_np.astype(np.float32)], axis=-1)         # (H,W,2)
-    else:
-        merged = np.stack([lbl, R_np.astype(np.float32)], axis=-1)         # (Z,Y,X,2)
-
-    merged_path = os.path.join(out_merged_dir, f"{stem}_label_plus_R.nii.gz")
-    save_nii(merged, affine, header, merged_path)
 
     return {
         "in": in_path,
         "r_full": r_full_path,
         "r_centerline": r_cl_path,
         "skeleton_prob": skel_path,
-        "merged": merged_path,
         "spacing": spacing,
         "vox_count": int(np.prod(mask_np.shape)),
         "fg_count": int(mask_np.sum())
@@ -454,7 +440,6 @@ def main():
     parser.add_argument("--use_dijkstra", action="store_true", help="使用 Dijkstra 版本（若同时给定，则以 Voronoi 优先）")
     parser.add_argument("--thresh", type=float, default=0.5, help="软中心线概率阈值（默认0.5）")
     parser.add_argument("--skel_iters", type=int, default=40, help="软骨架迭代次数（默认40）")
-    parser.add_argument("--save_skeleton_prob", action="store_true", help="是否保存 skeleton 概率 NIfTI（调试用）")
     parser.add_argument("--connectivity", type=int, default=26, help="Dijkstra 版本的连通性（3D:6/18/26; 2D:4/8）")
     args = parser.parse_args()
 
@@ -482,6 +467,8 @@ def main():
     os.makedirs(args.out_merged_dir, exist_ok=True)
 
     for i, f in enumerate(files, 1):
+        if i > 1:
+            break
         try:
             info = process_one_file(
                 f, args.out_debug_dir, args.out_merged_dir,
@@ -489,8 +476,9 @@ def main():
                 thresh=args.thresh,
                 skel_iters=args.skel_iters,
                 device=device,
+                save_r=True,
                 save_centerline_r=True,
-                save_skeleton_prob=args.save_skeleton_prob,
+                save_skeleton_prob=True,
                 use_dijkstra_connectivity=args.connectivity
             )
             print(f"[{i}/{len(files)}] Done: {os.path.basename(f)} | fg={info['fg_count']} -> "
@@ -501,32 +489,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-
-
-
-# 推荐（Voronoi 更快省显存）
-python batch_make_radius_maps.py \
-  --input_dir /path/to/labels_folder \
-  --out_debug_dir /path/to/debug_rmaps \
-  --out_merged_dir /path/to/merged_label_plus_r \
-  --use_voronoi \
-  --thresh 0.5 \
-  --skel_iters 40
-
-
-
-python batch_make_radius_maps.py \
-  --input_dir /path/to/labels_folder \
-  --out_debug_dir /path/to/debug_rmaps \
-  --out_merged_dir /path/to/merged_label_plus_r \
-  --use_voronoi \
-  --save_skeleton_prob
-
-
-
-python batch_make_radius_maps.py \
-  --input_dir /path/to/labels_folder \
-  --out_debug_dir /path/to/debug_rmaps \
-  --out_merged_dir /path/to/merged_label_plus_r \
-  --use_dijkstra --connectivity 26
 
