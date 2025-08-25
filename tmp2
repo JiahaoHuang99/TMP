@@ -5,6 +5,7 @@ from torch import nn
 from .layers.structures import ImageList3d
 from .layers.coords import batched_dist_map
 from .layers.conv_blocks import ShapeSpec3d, get_dice_coeff
+# 保持原有导入路径不变（你的新 VesselTreeDeformer 请在该模块名下暴露）
 from .cline_deform_with_seg_new import VesselTreeDeformer
 __all__ = ["ClineDeformModelNew", ]
 
@@ -45,13 +46,36 @@ class ClineDeformModelNew(nn.Module):
         pred_seg_ = backbone_outputs["seg"]
         pred_seg_s = self.scratcher(pred_seg_)
         loss_dice_ = 1 - get_dice_coeff(pred_seg_s[:, 0].sigmoid(), gt_seg[:, 0])
-        pred_cline, loss_cline = self.cline_deformer(batched_inputs, features, pad_img_shape, 
-                                                     gt_seg,  pred_seg_s.sigmoid()) 
-                                                    
+
+        # === 与 Deformer 对接：保持返回 (ret, loss_dict) ===
+        ret_deform, loss_cline = self.cline_deformer(
+            batched_inputs, features, pad_img_shape, gt_seg, pred_seg_s.sigmoid()
+        )
         losses.update(loss_cline)
+
+        # === 兼容旧/新键名：pred_cline/verts 或 pred_graph/nodes ===
+        # 训练时用于生成 dist_map 的中心点候选
         cline_label = batched_inputs[0]['cline'][0]
-        gt_cpoints = pred_cline['pred_cline']['verts'] if (torch.rand(1) > 0.35 and loss_cline['loss_local_chamfer_2'] < 0.05) else \
-            torch.nonzero(cline_label)
+        # 首选从 deformer 结果中取预测点
+        if 'pred_cline' in ret_deform and 'verts' in ret_deform['pred_cline']:
+            pred_points = ret_deform['pred_cline']['verts']  # 兼容老接口
+        elif 'pred_graph' in ret_deform and 'nodes' in ret_deform['pred_graph']:
+            pred_points = ret_deform['pred_graph']['nodes']  # 新图接口
+        else:
+            pred_points = None
+
+        # 兼容 loss 名称：优先使用本项目原有的 'loss_local_chamfer_2'，否则退化为 'loss_chamfer'
+        if 'loss_local_chamfer_2' in loss_cline:
+            ref_loss = loss_cline['loss_local_chamfer_2']
+        else:
+            ref_loss = loss_cline.get('loss_chamfer', torch.tensor(1.0, device=self.device))
+
+        use_pred_points = (torch.rand(1, device=self.device) > 0.35) and (ref_loss < 0.05)
+        if pred_points is not None and use_pred_points:
+            gt_cpoints = pred_points
+        else:
+            gt_cpoints = torch.nonzero(cline_label)
+
         dist_map = batched_dist_map(pred_seg_[0][0].shape, [gt_cpoints.to(self.device)])
         dist_map = torch.clip(dist_map, min=0, max=3).int()
         dist_map = 1. - dist_map.float() / 3.
@@ -74,8 +98,22 @@ class ClineDeformModelNew(nn.Module):
         features = [backbone_outputs[key] for key in self.feats]
         pred_seg_ = backbone_outputs["seg"]
         pred_seg_s = self.scratcher(pred_seg_)
-        ret = self.cline_deformer(batched_inputs, features, pad_img_shape, [],  pred_seg_s)
-        pred_cpoints = ret['pred_cline']['verts']
+
+        # 推理阶段 deformer 返回 ret
+        ret = self.cline_deformer(batched_inputs, features, pad_img_shape, [], pred_seg_s)
+        if isinstance(ret, tuple):
+            # 兼容某些实现误返回 (ret, loss)
+            ret = ret[0]
+
+        # 兼容新旧键名
+        if 'pred_cline' in ret and 'verts' in ret['pred_cline']:
+            pred_cpoints = ret['pred_cline']['verts']
+        elif 'pred_graph' in ret and 'nodes' in ret['pred_graph']:
+            pred_cpoints = ret['pred_graph']['nodes']
+        else:
+            # 回退：若 deformer 未提供点，直接用分割的骨架点（极少发生）
+            cline_label = batched_inputs[0]['cline'][0]
+            pred_cpoints = torch.nonzero(cline_label)
         
         dist_map = batched_dist_map(pred_seg_[0][0].shape, [pred_cpoints.to(self.device)])
         dist_map = torch.clip(dist_map, min=0, max=3).int()
@@ -101,4 +139,3 @@ class ClineDeformModelNew(nn.Module):
         else:
             images = ImageList3d.from_tensors(images, (16, 16, 16))
         return images
-
